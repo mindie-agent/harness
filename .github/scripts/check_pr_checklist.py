@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Focused `< 150`-line stdlib PR checklist validator (`--profile harness`).
+"""Parameterized Pre-PR Checklist validator across all 8 MindIE Agent repository classes.
 
 [Role]
-Validates Pull Request descriptions against `.github/pull_request_template.md`
-machine-stable checklist IDs (`HAR-ABI`, `HAR-UPGRADE`, `HAR-PROC`, `HAR-STATE`
-for `--profile harness`), supporting `not-applicable: docs-only` on docs-only PRs.
+Verifies that a Pull Request description completes the required machine-stable checklist IDs
+for `--profile {hub,harness,host-plugin,control-plane,state-service,device-tool,bench,corpus}`,
+paired with substantive Summary, Evidence (supporting `not-applicable: <specific reason>`),
+and Verification sections.
 
 [Invariants]
-- Pure Python stdlib; zero external dependencies or network calls.
-- Rejects unchecked `- [ ]` items, missing profile IDs, or placeholder sections.
+- Pure Python stdlib; zero external dependencies, subprocesses, or network calls.
+- Strips HTML comments and fenced code blocks (` ``` ` / `~~~`) before parsing checkboxes.
 
 [Timeouts & Locks]
-- Pure in-memory regex parsing (`< 20ms`); no locks.
+- Pure in-memory string parsing (`< 20ms`); acquires no locks.
 
 [Side-Effect Policy]
 - Read-only inspection of `--body-file`, `PR_BODY`, or `GITHUB_EVENT_PATH`.
@@ -25,9 +26,9 @@ from pathlib import Path
 import re
 import sys
 
-PROFILE_IDS: dict[str, tuple[str, ...]] = {
-    "harness": ("HAR-ABI", "HAR-UPGRADE", "HAR-PROC", "HAR-STATE"),
+PROFILE_ITEMS: dict[str, tuple[str, ...]] = {
     "hub": ("HUB-ROUTE", "HUB-DOC", "HUB-RELEASE", "HUB-GATE"),
+    "harness": ("HAR-ABI", "HAR-UPGRADE", "HAR-PROC", "HAR-STATE"),
     "host-plugin": ("HOST-NATIVE", "HOST-WIRE", "HOST-ADMISSION", "HOST-UPGRADE"),
     "control-plane": ("CTRL-LEASE-OR-AUTH", "CTRL-HANDLE", "CTRL-STREAM-IO", "CTRL-RECEIPT"),
     "state-service": ("SVC-CONSENT", "SVC-STATE-COMPAT", "SVC-LIFETIME", "SVC-EXPORT"),
@@ -37,95 +38,95 @@ PROFILE_IDS: dict[str, tuple[str, ...]] = {
 }
 PLACEHOLDERS = frozenset({"todo", "tbd", "n/a", "na", "none", "null", "-", "无", "略", "待补充"})
 COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+FENCE_RE = re.compile(r"^(?:```|~~~).*?^(?:```|~~~)\s*$", re.MULTILINE | re.DOTALL)
 HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
-UNCHECKED_RE = re.compile(r"^\s*-\s*\[\s\]\s+(.+)$", re.MULTILINE)
-CHECKED_ID_RE = re.compile(r"^\s*-\s*\[[xX]\]\s+\*\*([A-Z]+-[A-Z-]+)", re.MULTILINE)
-EVIDENCE_RE = re.compile(r"^\s*-\s*\*\*(?:自查结论与证据|Review Evidence)\*\*\s*[：:]\s*(.*)$", re.MULTILINE)
+CHECKBOX_RE = re.compile(r"^\s*-\s*\[([ xX])\]\s*(?:\*\*|`)*([A-Z]+(?:-[A-Z0-9]+)+)?(?:\*\*|`)*(.*)$", re.MULTILINE)
+ID_EVIDENCE_RE = re.compile(r"^\s*(?:[-*+]\s*(?:\[[ xX]\]\s*)?)?(?:\*\*|`)*([A-Z]+(?:-[A-Z0-9]+)+)(?:\*\*|`)*\s*[：:—-]\s*(.+)$", re.MULTILINE)
+SUMMARY_EVIDENCE_RE = re.compile(r"^\s*-\s*\*\*(?:自查结论与证据|Review Evidence)\*\*\s*[：:]\s*(.*)$", re.MULTILINE)
 
 
 def _sections(body: str) -> dict[str, str]:
-    matches = list(HEADING_RE.finditer(body))
-    return {
-        m.group(1).strip(): body[m.end() : (matches[i + 1].start() if i + 1 < len(matches) else len(body))].strip()
-        for i, m in enumerate(matches)
-    }
+    ms = list(HEADING_RE.finditer(body))
+    return {m.group(1).strip(): body[m.end() : (ms[i + 1].start() if i + 1 < len(ms) else len(body))].strip() for i, m in enumerate(ms)}
 
 
-def _find_sec(secs: dict[str, str], *keys: str) -> str | None:
-    for title, text in secs.items():
-        if any(k in title for k in keys):
-            return text
-    return None
+def _find(secs: dict[str, str], *kws: str) -> str | None:
+    return next((v for k, v in secs.items() if any(w.lower() in k.lower() for w in kws)), None)
 
 
-def _clean_lines(text: str) -> list[str]:
-    out = []
-    for raw in text.splitlines():
-        line = re.sub(r"^[-*+]\s+", "", raw.strip()).strip()
-        if line and not line.startswith(">") and line.lower() not in PLACEHOLDERS:
-            out.append(line)
-    return out
+def _is_valid_note(note: str) -> bool:
+    clean = re.sub(r"^[-*+]\s+", "", note.strip()).strip()
+    if not clean or clean.lower() in PLACEHOLDERS:
+        return False
+    if clean.lower().startswith("not-applicable"):
+        _, sep, reason = clean.partition(":")
+        return bool(sep) and len(r := reason.strip()) >= 6 and r.lower() not in PLACEHOLDERS
+    return len(clean) >= 8
 
 
-def validate_pr_body(raw_body: str, *, profile: str = "harness") -> list[str]:
-    required_ids = PROFILE_IDS.get(profile)
-    if required_ids is None:
-        return [f"Unknown checklist profile: {profile!r}"]
-    body = COMMENT_RE.sub("", raw_body or "")
+def _substantive_text(sec: str) -> str:
+    lns = [re.sub(r"^[-*+]\s+", "", ln.strip()).strip() for ln in sec.splitlines() if ln.strip() and not ln.strip().startswith(">")]
+    return " ".join(ln for ln in lns if ln and ln.lower() not in PLACEHOLDERS)
+
+
+def validate_pr_body(raw_body: str, *, profile: str = "hub") -> list[str]:
+    if profile not in PROFILE_ITEMS:
+        raise ValueError(f"Unsupported profile {profile!r}; expected one of {tuple(PROFILE_ITEMS)}")
+    body = FENCE_RE.sub("", COMMENT_RE.sub("", raw_body or ""))
     if not body.strip():
         return ["PR description is empty; fill out .github/pull_request_template.md."]
-
-    errors: list[str] = []
-    secs = _sections(body)
-    summary = _find_sec(secs, "变更摘要", "Summary")
-    if summary is None or sum(len(x) for x in _clean_lines(summary)) < 10:
-        errors.append("Section '## 变更摘要 (Summary)' must contain >= 10 substantive chars.")
-
-    review = _find_sec(secs, "Pre-PR Checklist", "核查清单", "设计原则 Review")
-    if review is None:
-        errors.append("Missing '## ... (Pre-PR Checklist)' section.")
+    secs, errors = _sections(body), []
+    if (summary := _find(secs, "Summary", "变更摘要")) is None or len(_substantive_text(summary)) < 10:
+        errors.append("Missing or placeholder '## 变更摘要 (Summary)' (>= 10 substantive chars required).")
+    if (review := _find(secs, "Pre-PR Checklist", "设计原则 Review", "Review")) is None:
+        errors.append("Missing required checklist section ('## 设计原则 Review (Pre-PR Checklist)' or '## Review').")
     else:
-        docs_only = "not-applicable: docs-only" in review.lower()
-        if UNCHECKED_RE.findall(review) and not docs_only:
-            errors.append("All Pre-PR Checklist items must be checked ('- [x]') or marked 'not-applicable: docs-only'.")
-        checked = set(CHECKED_ID_RE.findall(review))
-        if not docs_only:
-            for item_id in required_ids:
-                if item_id not in checked:
-                    errors.append(f"Missing checked item '- [x] **{item_id}...' for profile '{profile}'.")
-        ev = EVIDENCE_RE.search(review)
-        if ev is None:
-            errors.append("Missing '- **自查结论与证据**：<concrete evidence>' line.")
+        checked_ids: list[str] = []
+        for mark, item_id, rest in CHECKBOX_RE.findall(review):
+            if mark == " ":
+                errors.append(f"Unchecked checklist item: '{(item_id + ' ' + rest).strip()}'.")
+            elif item_id:
+                if item_id in checked_ids:
+                    errors.append(f"Duplicate checklist ID: '{item_id}'.")
+                checked_ids.append(item_id)
+        for req_id in PROFILE_ITEMS[profile]:
+            if req_id not in checked_ids:
+                errors.append(f"Missing checked checklist ID '{req_id}' for profile '{profile}'.")
+        ev_text = "\n".join(filter(None, [review, _find(secs, "Evidence", "自查证据")]))
+        per_id = {cid: val.strip() for cid, val in ID_EVIDENCE_RE.findall(ev_text) if cid in PROFILE_ITEMS[profile]}
+        if per_id:
+            for req_id in PROFILE_ITEMS[profile]:
+                if req_id not in per_id or not _is_valid_note(per_id[req_id]):
+                    errors.append(f"Checklist ID '{req_id}' requires concrete evidence or 'not-applicable: <specific reason>'.")
         else:
-            ev_text = (ev.group(1).strip() + " " + " ".join(_clean_lines(review[ev.end() :]))).strip()
-            if not docs_only and (ev_text.lower() in PLACEHOLDERS or len(ev_text) < 12):
-                errors.append("Review evidence must be concrete (>= 12 chars) or 'not-applicable: docs-only'.")
-
-    verif = _find_sec(secs, "验证结果", "Verification")
-    if verif is None or sum(len(x) for x in _clean_lines(verif)) < 10:
-        errors.append("Section '## 验证结果 (Verification)' must record actual commands/results (>= 10 chars).")
+            m = SUMMARY_EVIDENCE_RE.search(ev_text)
+            note = (m.group(1).strip() + " " + _substantive_text(ev_text[m.end() :])).strip() if m else ""
+            if not _is_valid_note(note) or len(note) < 15:
+                errors.append("Provide per-ID evidence ('ID: <evidence | not-applicable: reason>') or '- **自查结论与证据**: <notes>'.")
+    if (verif := _find(secs, "Verification", "验证结果")) is None or not _is_valid_note(_substantive_text(verif)):
+        errors.append("Missing or placeholder '## 验证结果 (Verification)'.")
     return errors
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", default="harness", choices=sorted(PROFILE_IDS))
-    parser.add_argument("--body-file", type=Path)
+    parser.add_argument("--profile", choices=tuple(PROFILE_ITEMS), default="hub")
+    parser.add_argument("--body-file", help="Path to markdown file containing PR body.")
     args = parser.parse_args(argv)
     if args.body_file:
-        body = args.body_file.read_text(encoding="utf-8-sig")
+        raw = Path(args.body_file).read_text(encoding="utf-8")
     elif "PR_BODY" in os.environ:
-        body = os.environ["PR_BODY"]
+        raw = os.environ["PR_BODY"]
     elif (ep := os.environ.get("GITHUB_EVENT_PATH")) and Path(ep).is_file():
-        body = ((json.loads(Path(ep).read_text(encoding="utf-8")).get("pull_request") or {}).get("body")) or ""
+        raw = (json.loads(Path(ep).read_text(encoding="utf-8")).get("pull_request") or {}).get("body") or ""
     else:
-        raise SystemExit("Provide --body-file, PR_BODY, or GITHUB_EVENT_PATH.")
-    errs = validate_pr_body(body, profile=args.profile)
-    if errs:
-        for e in errs:
-            print(f"  - {e}", file=sys.stderr)
+        raise SystemExit("No PR body source provided (use --body-file, PR_BODY, or GITHUB_EVENT_PATH).")
+    if errors := validate_pr_body(raw, profile=args.profile):
+        print(f"Pre-PR Checklist validation failed (profile={args.profile}):", file=sys.stderr)
+        for err in errors:
+            print(f"  - {err}", file=sys.stderr)
         return 1
-    print(f"Pre-PR Checklist passed (profile={args.profile}).")
+    print(f"Pre-PR Checklist validation passed (profile={args.profile}).")
     return 0
 
 
