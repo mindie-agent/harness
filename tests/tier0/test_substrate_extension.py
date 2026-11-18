@@ -85,7 +85,7 @@ def test_local_only_seed_stop_gate_and_template_budget(tmp_path: Path) -> None:
         {"schema": "mindie-community-config/1", "enabled": True, "local_only": True, "repository": None, "project_roots": [str(root)], "consent_config": str(cfg_dir / "mindie-consent.json")},
     )
     atomic_write_json(cfg_dir / "codex.json", {"host": "codex"})
-    assert _seed_stop_roots(cfg_dir / "codex.json") == [str(root.resolve())]
+    assert _seed_stop_roots(cfg_dir / "codex.json") == [os.path.normcase(str(root.resolve()))]
     for host in ("codex", "cc", "kimi", "dsh", "agy", "wb", "oc"):
         assert len(render_plugin_bootstrap_template(host).splitlines()) < 115
 
