@@ -40,6 +40,7 @@ from mindie_harness.mcp.gateway_dispatch import COMPONENT_MODULES, dispatch_remo
 from mindie_harness.mcp.router import RequestContext
 from mindie_harness.paths import HarnessError, ProfileRef, venv_python_path
 from mindie_harness.process.supervisor import Deadline, ProcessOutcome
+from mindie_harness.runtime import wheelhouse as wheelhouse_mod
 from mindie_harness.runtime import wheelhouse_assets
 from mindie_harness.runtime.builder import PreparedGeneration
 from mindie_harness.runtime.registry import RuntimeSelection
@@ -460,3 +461,78 @@ def test_component_default_command_and_spool_cap(tmp_path: Path, monkeypatch: py
     assert result["isError"] is False
     assert captured["max_output_bytes"] == 16 * 1024 * 1024
     assert captured["argv"] == (sys.executable, "-I", "-X", "utf8", "-m", "mindie_sim")
+
+
+def test_product_channel_normalization_bundle_members_and_override_builder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = _profile(tmp_path)
+    channel_dir = tmp_path / "channel"
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = channel_dir / "mindie-wheels-bundle.tar.gz"
+    req_bytes = b"mindie-harness==0.1.4\nreme-ai[as]==0.1.0\n"
+    manifest_bytes = b'{"schema_version":"mindie-wheels-bundle/1","product_version":"0.1.16"}\n'
+    wheel_bytes = b"wheel-bytes"
+    with tarfile.open(bundle_path, "w:gz") as archive:
+        for member_name, payload in (
+            ("mindie_harness-0.1.4-py3-none-any.whl", wheel_bytes),
+            ("requirements.txt", req_bytes),
+            ("bundle-manifest.json", manifest_bytes),
+        ):
+            info = tarfile.TarInfo(member_name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    channel_doc = {
+        "schema": "mindie-release-channel/1",
+        "current_patch_version": "0.1.16",
+        "components": {
+            "harness": {
+                "role": "shared_component",
+                "repository": "mindie-agent/harness",
+                "package": "mindie-harness",
+                "version": "0.1.4",
+                "commit": "a" * 40,
+            },
+            "mindie-bench": {
+                "role": "evaluation_component",
+                "repository": "mindie-agent/mindie-bench",
+                "package": "mindie-bench",
+                "version": "0.4.13",
+                "commit": "b" * 40,
+            },
+            "mindie-agent-codex": {
+                "role": "harness_plugin",
+                "repository": "mindie-agent/mindie-agent-codex",
+                "version": "0.1.38",
+                "commit": "c" * 40,
+            },
+        },
+    }
+    atomic_write_json(channel_dir / "release-channel.json", channel_doc)
+    sums = "\n".join(
+        f"{hashlib.sha256((channel_dir / name).read_bytes()).hexdigest()}  {name}"
+        for name in ("release-channel.json", "mindie-wheels-bundle.tar.gz")
+    ) + "\n"
+    (channel_dir / "SHA256SUMS").write_text(sums, encoding="utf-8")
+
+    discovered = discover_channel(profile, channel_base_url=str(channel_dir))
+    assert discovered["product_version"] == "0.1.16"
+    assert set(discovered["components"]) == {"mindie-harness"}
+    assert discovered["components"]["mindie-harness"]["revision"] == "a" * 40
+
+    staged = stage_wheelhouse(profile, channel=discovered, dest_dir=tmp_path / "wh")
+    assert (staged / "requirements.txt").read_bytes() == req_bytes
+    assert (staged / "bundle-manifest.json").read_bytes() == manifest_bytes
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(spec, *, deadline, cancel=None):
+        calls.append(tuple(spec.argv))
+        return ProcessOutcome(execution="completed", returncode=0, stdout="", stderr="", elapsed_ms=1)
+
+    monkeypatch.setattr(wheelhouse_mod, "run_owned", fake_run)
+    monkeypatch.setattr(wheelhouse_mod, "_resolve_uv", lambda env: "/usr/bin/uv")
+    builder = wheelhouse_mod._wheelhouse_builder(profile, staged, offline=True)
+    builder(tmp_path / "gen", tmp_path / "gen" / "venv", {}, Deadline.from_timeout(30.0))
+    pip_call = calls[1]
+    assert "--override" in pip_call and "-r" in pip_call
+    assert str(staged / "requirements.txt") in pip_call
+    assert "--offline" in pip_call and "--no-index" in pip_call

@@ -188,7 +188,7 @@ def extract_wheel_bundle_safely(tar_path: Path, dest_dir: Path) -> Path:
             name = str(member.name or "")
             if _unsafe_member(name, member):
                 raise _fail("unsafe_archive_member", f"Unsafe tar member rejected: {name!r}", stage="wheelhouse_extract", retryable=False)
-            if not member.isfile() or not (name.endswith(".whl") or name in {CHECKSUM_NAME, "requirements.lock"}):
+            if not member.isfile() or not (name.endswith(".whl") or name in {CHECKSUM_NAME, "requirements.lock", "requirements.txt", "bundle-manifest.json"}):
                 continue
             destination = (root / name).resolve()
             try:

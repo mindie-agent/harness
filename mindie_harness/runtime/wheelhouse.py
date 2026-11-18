@@ -35,7 +35,6 @@ import os
 from pathlib import Path
 import shutil
 import tarfile
-import tempfile
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -101,10 +100,19 @@ def _normalize_components(raw: Any) -> dict[str, dict[str, str]]:
         if isinstance(meta, str):
             meta = {"version": meta}
         if isinstance(meta, Mapping):
-            entry = {"version": str(meta.get("version") or ""), "revision": str(meta.get("revision") or "")}
+            role = str(meta.get("role") or "").strip()
+            if role and role != "shared_component":
+                continue
+            pkg_name = str(meta.get("package") or name).strip()
+            if role == "shared_component" and pkg_name not in _SMOKE_MODULES:
+                continue
+            entry = {
+                "version": str(meta.get("version") or ""),
+                "revision": str(meta.get("revision") or meta.get("commit") or ""),
+            }
             if meta.get("repository"):
                 entry["repository"] = str(meta["repository"])
-            out[str(name)] = entry
+            out[pkg_name] = entry
     return out
 
 def _read_backoff(profile: ProfileRef) -> dict[str, Any] | None:
@@ -202,7 +210,7 @@ def discover_channel(
     components = _normalize_components(raw.get("components") or raw.get("repositories") or {})
     channel = {
         "status": "ok",
-        "product_version": str(raw.get("product_version") or raw.get("version") or ""),
+        "product_version": str(raw.get("current_patch_version") or raw.get("product_version") or raw.get("version") or ""),
         "components": components,
         "repositories": _normalize_components(raw.get("repositories") or raw.get("components") or {}),
         "checksums": checksums,
@@ -319,7 +327,8 @@ def stage_wheelhouse(
         raise _fail(str(payload.get("reason") or "channel_unavailable"), f"Channel discovery is {payload.get('status')}", details={"next_retry_at": payload.get("next_retry_at")})
     if dest_dir is None:
         profile.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        dest = Path(tempfile.mkdtemp(prefix="wheelhouse-", dir=str(profile.state_dir)))
+        dest = profile.state_dir / f"wheelhouse-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        dest.mkdir(parents=True, exist_ok=True, mode=0o700)
     else:
         dest = Path(dest_dir)
         dest.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -351,8 +360,8 @@ def _wheelhouse_builder(profile: ProfileRef, wheelhouse: Path, *, offline: bool)
         uv_bin = _resolve_uv(build_env)
         run_owned(ProcessSpec(argv=(uv_bin, "venv", "--python", str(resolve_host_python(build_env)), str(venv_dir)), env=build_env, role="background_maintenance", memory_limit_bytes=None), deadline=deadline)
         cmd = [uv_bin, "--native-tls", "pip", "install", "--python", str(venv_python_path(venv_dir)), "--find-links", str(wheelhouse)]
-        lock_file = wheelhouse / "requirements.lock"
-        cmd.extend(["-r", str(lock_file)] if lock_file.is_file() else [str(p) for p in sorted(wheelhouse.glob("*.whl"))])
+        req_file = next((wheelhouse / n for n in ("requirements.lock", "requirements.txt") if (wheelhouse / n).is_file()), None)
+        cmd.extend(["--override", str(req_file), "-r", str(req_file)] if req_file is not None else [str(p) for p in sorted(wheelhouse.glob("*.whl"))])
         if offline or "--offline" in str(build_env.get("_MINDIE_UV_FLAGS") or ""):
             cmd.extend(["--offline", "--no-index"])
         run_owned(ProcessSpec(argv=tuple(cmd), cwd=profile.plugin_root if profile.plugin_root.is_dir() else None, env=build_env, role="background_maintenance", memory_limit_bytes=None), deadline=deadline)
