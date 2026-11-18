@@ -360,9 +360,12 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
 
     assert CORRELATION_STRIP_KEYS == frozenset({"_mindie_bind_id", "request_nonce", "context_file"})
 
-    # 0. Explicit `tools=[]` stays empty, whereas `tools=None` defaults to `[mindie_status]`.
+    # 0. Explicit `tools=[]` stays empty, whereas `tools=None` defaults to status + doctor.
     assert MCPRouter(profile, surface="tools", tools=[], base_env={}).list_tools() == []
-    assert [t["name"] for t in MCPRouter(profile, surface="tools", tools=None, base_env={}).list_tools()] == ["mindie_status"]
+    assert [t["name"] for t in MCPRouter(profile, surface="tools", tools=None, base_env={}).list_tools()] == [
+        "mindie_status",
+        "mindie_doctor",
+    ]
 
     # 1. Single-point normalization in `__init__` strips CORRELATION_STRIP_KEYS from `properties` AND `required`.
     for surface in ("knowledge", "tools", "all"):

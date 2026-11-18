@@ -5,7 +5,6 @@ Extends the RSI experiment ledger and loop with `parent_exp_ids` multi-parent
 crossover tracking, orthogonal sibling candidate discovery, and automatic
 Gate-3 Leave-One-Out ablation verification from already-measured ledger
 controls on a shared ancestor baseline.
-
 [Invariants]
 - Cumulative speedup ALWAYS remains grounded in the single measured
   `baseline_exp_id` / `baseline_source_digest` chain—unmeasured sibling
@@ -18,7 +17,6 @@ controls on a shared ancestor baseline.
 
 [Timeouts & Locks]
 - Pure in-memory $O(N^2)$ scan over folded live ledger records; no I/O or locks.
-
 [Side-Effect Policy]
 - Pure functional helpers; callers commit through `experiment_ledger.append`.
 """
@@ -28,9 +26,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
-
 ABLATION_EVIDENCE_KEYS = ("ablation_retained", "ablation_ok", "ablation_passed", "ablation", "ablation_receipt")
-
 
 def normalize_parent_exp_ids(raw_parents: Any, *, exp_id: str | None = None, baseline_exp_id: str | None = None) -> list[str] | None:
     """Validate and deduplicate constituent `parent_exp_ids`."""
@@ -56,7 +52,6 @@ def normalize_parent_exp_ids(raw_parents: Any, *, exp_id: str | None = None, bas
             cleaned.insert(0, base)
     return cleaned
 
-
 def default_ablation_retained(evidence: Mapping[str, Any]) -> bool | None:
     """Return `None` (pending) whenever multi-factor or multi-parent ablation is required."""
     factors = evidence.get("factors")
@@ -71,7 +66,6 @@ def default_ablation_retained(evidence: Mapping[str, Any]) -> bool | None:
             return None
     return True
 
-
 def _positive_ratio(rec: Mapping[str, Any]) -> float | None:
     raw = rec.get("speedup_ratio")
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
@@ -79,10 +73,8 @@ def _positive_ratio(rec: Mapping[str, Any]) -> float | None:
     val = float(raw)
     return val if math.isfinite(val) and val > 0.0 else None
 
-
 def _cond_key(conds: Any) -> str:
     return json.dumps(conds or {}, sort_keys=True)
-
 
 def _factors_set(rec: Mapping[str, Any]) -> set[str]:
     raw = rec.get("factors")
@@ -90,10 +82,8 @@ def _factors_set(rec: Mapping[str, Any]) -> set[str]:
         return set()
     return {str(f).strip() for f in raw if isinstance(f, str) and str(f).strip()}
 
-
 def _canon_id(rec: Mapping[str, Any]) -> str:
     return str(rec.get("exp_id") or rec.get("candidate_id") or "").strip()
-
 
 def _build_kept_lookup(
     live: Sequence[Mapping[str, Any]],
@@ -116,7 +106,6 @@ def _build_kept_lookup(
                 all_alias_owners.setdefault(alias, set()).add(id(rec))
                 if not is_kept and alias not in reserved_ids:
                     global_non_kept_ids.add(alias)
-
     scoped = [rec for rec in live if _cond_key(rec.get("conditions")) == cond_filter] if cond_filter is not None else list(live)
     exact: dict[str, Mapping[str, Any]] = {}
     kept_alias_hits: dict[str, list[Mapping[str, Any]]] = {}
@@ -135,7 +124,6 @@ def _build_kept_lookup(
             alias = str(raw_alias or "").strip()
             if alias and alias != cid:
                 kept_alias_hits.setdefault(alias, []).append(rec)
-
     merged = dict(exact)
     for alias, owners in kept_alias_hits.items():
         if (
@@ -147,7 +135,6 @@ def _build_kept_lookup(
         ):
             merged[alias] = owners[0]
     return merged
-
 
 def snapshot_parent_source_digests(
     live: Sequence[Mapping[str, Any]],
@@ -171,7 +158,6 @@ def snapshot_parent_source_digests(
         for raw_p in parent_exp_ids
         if (pid := str(raw_p or "").strip())
     }
-
 
 def bind_fold_lineage(
     live: dict[Any, dict[str, Any]],
@@ -208,7 +194,6 @@ def bind_fold_lineage(
             }
     else:
         record.pop("_bound_parent_digests", None)
-
     if prior_rec is not None:
         aliases = [
             a
@@ -241,7 +226,6 @@ def bind_fold_lineage(
             if key == prior
             else {(key if k == prior else k): (record if k == prior else v) for k, v in live.items() if k != key}
         )
-
     if "_superseded_ids" in record:
         kept_sup = [a for a in (record.get("_superseded_ids") or ()) if a != key]
         if kept_sup:
@@ -252,7 +236,6 @@ def bind_fold_lineage(
         record["_same_source_aliases"] = [a for a in (record.get("_same_source_aliases") or ()) if a != key]
     live[key] = record
     return live
-
 
 def _resolve_bound_parent_canon_set(
     rec: Mapping[str, Any],
@@ -280,10 +263,8 @@ def _resolve_bound_parent_canon_set(
         resolved.add(_canon_id(p_rec))
     return resolved
 
-
 class _CondLineage:
     """Per-condition-scope baseline and alias index with task-global primary ID reservation."""
-
     def __init__(self, live: Sequence[Mapping[str, Any]], cond: str) -> None:
         cond_records = [rec for rec in live if _cond_key(rec.get("conditions")) == cond]
         self.by_id = _build_kept_lookup(live, cond_filter=cond, same_source_only=True)
@@ -297,13 +278,11 @@ class _CondLineage:
         }
         self.non_kept_digests: set[str] = set()
         seen_objs: set[int] = set()
-
         for rec in live:
             if rec.get("verdict") not in {"supported", "subtarget_valid"}:
                 for old in rec.get("_superseded_ids") or ():
                     if isinstance(old, str) and old.strip() and old.strip() not in global_primary_ids:
                         self.non_kept_ids.add(old.strip())
-
         for rec in cond_records:
             cid = _canon_id(rec)
             src = str(rec.get("source_digest") or "").strip()
@@ -323,7 +302,6 @@ class _CondLineage:
                 if src:
                     self.non_kept_digests.add(src)
                 self.non_kept_ids.update(alias_ids)
-
     def resolve_parent_step(self, rec: Mapping[str, Any]) -> tuple[str, Mapping[str, Any] | None]:
         cid = _canon_id(rec)
         own_ids = {cid, *(str(a).strip() for a in (rec.get("_superseded_ids") or ()) if str(a).strip())}
@@ -354,7 +332,6 @@ class _CondLineage:
                 return "invalid", None
             return "root", None
         return "root", None
-
     def has_valid_lineage(self, rec: Mapping[str, Any], *, require_positive_step: bool = True) -> bool:
         seen: set[int] = set()
         curr: Mapping[str, Any] | None = rec
@@ -373,7 +350,6 @@ class _CondLineage:
             if kind == "root":
                 return True
         return True
-
     def is_valid_baseline_ref(self, b_exp: str, b_src: str) -> bool:
         if not b_src:
             return False
@@ -394,7 +370,6 @@ class _CondLineage:
             return self.has_valid_lineage(matches[0])
         return b_src not in self.non_kept_digests
 
-
 def resolve_kept_anchor(live: Sequence[Mapping[str, Any]], anchor_id: str) -> Mapping[str, Any] | None:
     """Resolve a canonical or unambiguous `_superseded_ids` kept anchor with valid lineage."""
     target = anchor_id.strip()
@@ -408,7 +383,6 @@ def resolve_kept_anchor(live: Sequence[Mapping[str, Any]], anchor_id: str) -> Ma
     if not lineage.has_valid_lineage(match, require_positive_step=False):
         return None
     return match
-
 
 def suggest_orthogonal_crossovers(
     live: Sequence[Mapping[str, Any]],
@@ -432,7 +406,6 @@ def suggest_orthogonal_crossovers(
             resolved = _resolve_bound_parent_canon_set(rec, lookup)
             if resolved is not None and len(resolved) >= 2:
                 recorded_sets.add(frozenset(resolved))
-
     by_anchor: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
     for rec in kept:
         cond = _cond_key(rec.get("conditions"))
@@ -447,7 +420,6 @@ def suggest_orthogonal_crossovers(
             continue
         canon_base_exp = _canon_id(parent_rec) if kind == "ok" and parent_rec is not None else ""
         by_anchor.setdefault((cond, base_digest, canon_base_exp), []).append(rec)
-
     suggestions: list[dict[str, Any]] = []
     for (_, base_digest, base_exp), group in by_anchor.items():
         if len(group) < 2:
@@ -472,14 +444,12 @@ def suggest_orthogonal_crossovers(
                     if len(raw_exps) > 1:
                         continue
                     eff_base_exp = next(iter(raw_exps), "")
-
                 fac_a, fac_b = _factors_set(a), _factors_set(b)
                 if fac_a and fac_b and not fac_a.isdisjoint(fac_b):
                     continue
                 lane_a, lane_b = str(a.get("bottleneck_lane") or "").strip(), str(b.get("bottleneck_lane") or "").strip()
                 if lane_a and lane_b and lane_a == lane_b:
                     continue
-
                 ratio_a, ratio_b = _positive_ratio(a) or 1.0, _positive_ratio(b) or 1.0
                 est = round(ratio_a * ratio_b, 6)
                 suggested_factors = sorted(fac_a | fac_b) if len(fac_a) == 1 and len(fac_b) == 1 and fac_a != fac_b else None
@@ -495,10 +465,8 @@ def suggest_orthogonal_crossovers(
                         "parent_summaries": [str(a.get("mutation_summary") or ""), str(b.get("mutation_summary") or "")],
                     }
                 )
-
     suggestions.sort(key=lambda item: (-float(item["independent_estimate_ratio"]), item["parent_exp_ids"]))
     return suggestions[: max(1, int(limit))]
-
 
 def derive_crossover_ablation_receipt(
     live: Sequence[Mapping[str, Any]],
@@ -522,11 +490,9 @@ def derive_crossover_ablation_receipt(
         or float(combined_speedup_ratio) <= 0.0
     ):
         return None
-
     margin, cond, base_src = max(0.0, float(noise_margin)), _cond_key(conditions), (baseline_source_digest or "").strip()
     if not base_src:
         return None
-
     lineage = _CondLineage(live, cond)
     by_id = lineage.by_id
     parents: list[Mapping[str, Any]] = []
@@ -549,12 +515,10 @@ def derive_crossover_ablation_receipt(
             parent_by_canon[cid] = found
     if len(parents) < 2:
         return None
-
     anchor_digests = {str(p.get("baseline_source_digest") or "").strip() for p in parents}
     if len(anchor_digests) != 1 or "" in anchor_digests:
         return None
     shared_bk_digest = next(iter(anchor_digests))
-
     cand_facs: set[str] | None = None
     required_loo_sets: set[frozenset[str]] | None = None
     if candidate_factors is not None and len(candidate_factors) > 0:
@@ -565,9 +529,7 @@ def derive_crossover_ablation_receipt(
         if not cand_facs.issubset(parent_union):
             return None
         required_loo_sets = {frozenset(cand_facs - {f}) for f in cand_facs}
-
     memo_vs_bk: dict[int, float | None] = {}
-
     def _resolve_rec_vs_bk(rec: Mapping[str, Any]) -> float | None:
         obj_id = id(rec)
         if obj_id in memo_vs_bk:
@@ -602,7 +564,6 @@ def derive_crossover_ablation_receipt(
             curr = parent_rec
         memo_vs_bk[obj_id] = None
         return None
-
     selected_controls: dict[str, tuple[float, Mapping[str, Any]]] = {}
     unique_kept = list({id(r): r for r in by_id.values()}.values())
     if len(parents) == 2:
@@ -642,12 +603,10 @@ def derive_crossover_ablation_receipt(
                 return None
             best_ratio, best_cid, best_rec = max(cands, key=lambda item: (round(item[0], 12), item[1]))
             selected_controls[best_cid] = (best_ratio, best_rec)
-
     if cand_facs is not None:
         control_factor_sets = [_factors_set(ctrl) for _, ctrl in selected_controls.values()]
         if not all(any(cf == (cand_facs - {f}) for cf in control_factor_sets) for f in cand_facs):
             return None
-
     measured = float(combined_speedup_ratio)
     b_exp_clean = (baseline_exp_id or "").strip()
     if base_src == shared_bk_digest:
@@ -690,12 +649,10 @@ def derive_crossover_ablation_receipt(
                 "reason": "incremental crossover gain over base control did not exceed noise_margin",
             }
         effective_vs_bk = base_ctrl_ratio * measured
-
     control_ratios = {cid: ratio for cid, (ratio, _) in selected_controls.items()}
     best_single_id, best_single_ratio = max(control_ratios.items(), key=lambda kv: (round(kv[1], 12), kv[0]))
     incremental_over_best = effective_vs_bk / best_single_ratio
     retained = incremental_over_best > (1.0 + margin)
-
     if retained:
         return {
             "status": "verified_from_orthogonal_parents",
@@ -725,7 +682,6 @@ def derive_crossover_ablation_receipt(
         ),
     }
 
-
 def _matches_committed_evidence(
     existing: Mapping[str, Any],
     evidence: Mapping[str, Any],
@@ -750,7 +706,6 @@ def _matches_committed_evidence(
         and rnd("baseline_metric") == existing.get("baseline_metric")
         and rnd("candidate_metric") == existing.get("candidate_metric")
     )
-
 
 def resolve_measure_ablation_receipt(
     *,

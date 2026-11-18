@@ -109,6 +109,8 @@ def read_pending_update_check(profile: ProfileRef) -> dict[str, Any] | None:
 def clear_pending_update_check(profile: ProfileRef) -> None:
     try:
         profile.pending_update_path.unlink(missing_ok=True)
+    except TimeoutError:
+        raise
     except OSError:
         pass
 
@@ -148,8 +150,12 @@ def _directory_size_bounded(root: Path, deadline: float) -> int:
                             stack.append(Path(entry.path))
                         else:
                             total += entry.stat(follow_symlinks=False).st_size
+                    except TimeoutError:
+                        raise
                     except OSError:
                         continue
+        except TimeoutError:
+            raise
         except OSError:
             continue
     return total
@@ -220,6 +226,8 @@ def _collect_protected_generations(
                             age = time.time() - b_sentinel.stat().st_mtime
                             if age < STALE_BUILDING_SECONDS:
                                 protected.add(cand_dir)
+                        except TimeoutError:
+                            raise
                         except OSError:
                             protected.add(cand_dir)
                         continue
@@ -232,6 +240,8 @@ def _collect_protected_generations(
                     ):
                         ts = float(receipt["validation"].get("validated_at") or entry.stat().st_mtime)
                         validated_candidates.append((ts, cand_dir))
+        except TimeoutError:
+            raise
         except OSError:
             pass
 
@@ -268,6 +278,8 @@ def _is_prepare_lock_held(cand_dir: Path) -> bool:
         probe.acquire()
     except LockTimeoutError:
         return True
+    except TimeoutError:
+        raise
     except OSError:
         return True
     probe.release()

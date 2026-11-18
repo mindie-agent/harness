@@ -5,14 +5,17 @@ Exposes the single authoritative public contract (`API_VERSION = 1`) consumed by
 `mindie-agent-{codex,cc,kimi,dsh,agy,wb,oc}`: `HostAdapter`, `DefaultHostAdapter`,
 `ProfileRef`, `Deadline`, `ProcessSpec`, `ProcessOutcome`, `RuntimeSelection`,
 `PreparedGeneration`, `ActivationResult`, `run_owned`, `prepare_runtime`,
-`activate_runtime`, `maintain_runtime`, `serve_mcp`, and `run_host`.
+`activate_runtime`, `maintain_runtime`, `serve_mcp`, and `run_host`. The default
+adapter registers read-only `mindie_status` and `mindie_doctor` tools, dispatching
+doctor through the lazy diagnostics module or bounded CLI fallback.
 
 [Invariants]
 - 100% pure Python stdlib at top-level import (`< 15ms` cold import, zero device
   context, zero `mindie_knowledge` / `mindie_diagnostics` / `torch` imports).
-- CLI subcommands (`inspect`, `prepare`, `activate`, `maintain`, `run`, `mcp`)
-  accept `--host`, `--plugin-root`, `--config`, and `--data-dir` either before OR
-  after the subcommand name so plugin launchers never fail on flag ordering.
+- CLI subcommands (`inspect`, `prepare`, `activate`, `maintain`, `run`, `mcp`,
+  `doctor`, `sharing`, `update`, `install`) accept `--host`, `--plugin-root`,
+  `--config`, and `--data-dir` before OR after the subcommand name so plugin
+  launchers never fail on flag ordering; `mcp --managed` opts into the gateway.
 
 [Timeouts & Locks]
 - Delegates process supervision, candidate builds, atomic switches, GC, and MCP
@@ -35,6 +38,7 @@ from typing import Any, BinaryIO, Final, Protocol, runtime_checkable
 
 from .atomic import read_json_safe
 from .locks import LockTimeoutError
+from .mcp.doctor import DOCTOR_TOOL_NAME, doctor_tool_definition, run_doctor_tool
 from .mcp.router import MCPRouter, RequestContext
 from .mcp.server import MCPStdioServer
 from .paths import (
@@ -67,7 +71,7 @@ from .runtime.activation import (
 from .runtime.builder import PreparedGeneration, prepare_candidate_runtime
 from .runtime.registry import SHARED_COMPONENTS, RuntimeSelection
 
-__version__: Final[str] = "0.1.2"
+__version__: Final[str] = "0.1.3"
 API_VERSION: Final[int] = 1
 
 
@@ -150,7 +154,8 @@ class DefaultHostAdapter:
                 "description": "Inspect active MindIE Harness runtime and profile state.",
                 "annotations": {"readOnlyHint": True},
                 "inputSchema": {"type": "object", "properties": {}, "required": []},
-            }
+            },
+            doctor_tool_definition(),
         ]
 
     def dispatch_tool(
@@ -168,6 +173,16 @@ class DefaultHostAdapter:
                 "content": [{"type": "text", "text": json.dumps(body, sort_keys=True)}],
                 "isError": False,
             }
+        if ctx.tool_name == DOCTOR_TOOL_NAME:
+            doctor_args = dict(arguments)
+            if "cwd" not in doctor_args and ctx.cwd is not None:
+                doctor_args["cwd"] = str(ctx.cwd)
+            return run_doctor_tool(
+                doctor_args,
+                deadline=ctx.deadline,
+                cancel=ctx.cancel,
+                env=ctx.env,
+            )
         raise HarnessError(
             f"No tool dispatcher configured for {ctx.tool_name!r}",
             stage="dispatch",
@@ -252,16 +267,27 @@ def serve_mcp(
     *,
     profile: ProfileRef,
     adapter: HostAdapter | None = None,
+    managed: bool = False,
     stdin: BinaryIO | None = None,
     stdout: BinaryIO | None = None,
 ) -> int:
     """Start the resident concurrent dual-framing stdio MCP server for `surface`."""
-    eff_adapter = adapter or DefaultHostAdapter(
-        profile.host,
-        plugin_root=profile.plugin_root,
-        config_path=profile.config_path,
-        data_dir=profile.data_dir,
-    )
+    if adapter is None and managed:
+        from .mcp.gateway import ManagedMCPAdapter
+
+        eff_adapter: HostAdapter = ManagedMCPAdapter(
+            profile.host,
+            plugin_root=profile.plugin_root,
+            config_path=profile.config_path,
+            data_dir=profile.data_dir,
+        )
+    else:
+        eff_adapter = adapter or DefaultHostAdapter(
+            profile.host,
+            plugin_root=profile.plugin_root,
+            config_path=profile.config_path,
+            data_dir=profile.data_dir,
+        )
     tools = eff_adapter.mcp_tools(surface, profile)
     router = MCPRouter(
         profile,
@@ -359,6 +385,40 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     p_mcp = sub.add_parser("mcp", help="Serve resident concurrent stdio MCP gateway.")
     _add_profile_flags(p_mcp, subparser=True)
     p_mcp.add_argument("surface", nargs="?", default="all", choices=("remote", "tools", "components", "knowledge", "all"))
+    p_mcp.add_argument("--managed", nargs="?", const=True, default=False, choices=("remote", "tools", "components", "knowledge", "all"), help="Use ManagedMCPAdapter (optional surface override).")
+
+    p_doctor = sub.add_parser("doctor", help="Run the read-only MindIE diagnostics doctor.")
+    _add_profile_flags(p_doctor, subparser=True)
+    p_doctor.add_argument("--probe-remote", action="store_true")
+    p_doctor.add_argument("--cwd", default=None)
+    p_doctor.add_argument("--timeout", type=float, default=None)
+
+    p_sharing = sub.add_parser("sharing", help="Configure or inspect local/community sharing consent.")
+    _add_profile_flags(p_sharing, subparser=True)
+    p_sharing.add_argument("--status", action="store_true")
+    p_sharing.add_argument("--enable", action="store_true", help="Select the contribute tier.")
+    p_sharing.add_argument("--local-only", action="store_true", help="Capture local transcripts without reporting.")
+    p_sharing.add_argument("--disable", action="store_true")
+    p_sharing.add_argument("--project-root", action="append", default=[])
+    p_sharing.add_argument("--repository")
+    p_sharing.add_argument("--fork")
+    p_sharing.add_argument("--account")
+
+    p_update = sub.add_parser("update", help="Provision the zero-Git prebuilt runtime wheelhouse.")
+    _add_profile_flags(p_update, subparser=True)
+    p_update.add_argument("--force", action="store_true")
+    p_update.add_argument("--offline", action="store_true")
+    p_update.add_argument("--channel-base-url")
+    p_update.add_argument("--background", action="store_true")
+
+    p_install = sub.add_parser("install", help="Detect native hosts and provision the shared runtime.")
+    p_install.add_argument("--host", choices=("auto", *HOSTS), default=argparse.SUPPRESS)
+    p_install.add_argument("--plugin-root", default=argparse.SUPPRESS)
+    p_install.add_argument("--config", default=argparse.SUPPRESS)
+    p_install.add_argument("--data-dir", default=argparse.SUPPRESS)
+    p_install.add_argument("--channel-base-url")
+    p_install.add_argument("--offline", action="store_true")
+    p_install.add_argument("--skip-runtime", action="store_true")
 
     return parser
 
@@ -386,6 +446,34 @@ def run_host(
     if not args.subcommand:
         parser.print_help(sys.stderr)
         return 2
+
+    if args.subcommand == "install":
+        try:
+            from .installer import run_install
+
+            install_env = dict(os.environ)
+            install_config = getattr(args, "config", None)
+            install_data_dir = getattr(args, "data_dir", None)
+            if install_config:
+                install_env["MINDIE_AGENT_CONFIG"] = str(install_config)
+            if install_data_dir:
+                install_env["MINDIE_DATA_HOME"] = str(install_data_dir)
+            install_res = run_install(
+                host=getattr(args, "host", None) or "auto",
+                plugin_root=getattr(args, "plugin_root", None),
+                channel_base_url=args.channel_base_url,
+                offline=args.offline,
+                env=install_env,
+                skip_runtime=args.skip_runtime,
+            )
+            _emit_json(install_res)
+            return 0 if install_res.get("status") != "error" else 1
+        except HarnessError as exc:
+            _emit_json({"status": "error", **exc.to_dict()})
+            return 1
+        except TimeoutError as exc:
+            _emit_json({"status": "error", "stage": "timeout", "reason": "deadline_exceeded", "message": str(exc)})
+            return 1
 
     eff_host = args.host or (adapter.host if adapter is not None else "codex")
     try:
@@ -439,6 +527,8 @@ def run_host(
             if args.event == "session-start":
                 try:
                     write_pending_update_check(profile, reason="session_start")
+                except TimeoutError:
+                    raise
                 except OSError:
                     pass
             hook_fn = getattr(adapter, "run_hook", None) if adapter is not None else None
@@ -484,8 +574,58 @@ def run_host(
             )
             return 0 if outcome.returncode == 0 else int(outcome.returncode or 1)
 
+        if args.subcommand == "doctor":
+            if args.timeout is not None and args.timeout <= 0:
+                raise HarnessError("doctor --timeout must be positive", stage="cli_input", reason="invalid_timeout_budget", reportable=False)
+            doctor_args: dict[str, Any] = {"probe_remote": bool(args.probe_remote)}
+            if args.cwd:
+                doctor_args["cwd"] = args.cwd
+            doctor_deadline = (
+                Deadline.from_timeout(args.timeout, cleanup_grace=5.0)
+                if args.timeout is not None
+                else Deadline.from_timeout(20.0 if args.probe_remote else 15.0, cleanup_grace=5.0)
+            )
+            _emit_json(run_doctor_tool(doctor_args, deadline=doctor_deadline))
+            return 0
+
+        if args.subcommand == "sharing":
+            from .sharing import configure_sharing, sharing_status
+
+            if args.status or not (args.enable or args.local_only or args.disable):
+                _emit_json(sharing_status(profile, cwd=Path.cwd()))
+                return 0
+            selected = "contribute" if args.enable else ("local-only" if args.local_only else "disabled")
+            _emit_json(
+                configure_sharing(
+                    profile,
+                    choice=selected,
+                    project_roots=args.project_root,
+                    repository=args.repository,
+                    fork=args.fork,
+                    account=args.account,
+                )
+            )
+            return 0
+
+        if args.subcommand == "update":
+            from .runtime.wheelhouse import update_runtime
+
+            _emit_json(
+                update_runtime(
+                    profile,
+                    force=args.force,
+                    offline=args.offline,
+                    channel_base_url=args.channel_base_url,
+                    background=args.background,
+                )
+            )
+            return 0
+
         if args.subcommand == "mcp":
-            return serve_mcp(args.surface, profile=profile, adapter=adapter)
+            managed_surface = args.managed
+            if isinstance(managed_surface, str):
+                args.surface = managed_surface
+            return serve_mcp(args.surface, profile=profile, adapter=adapter, managed=bool(managed_surface))
 
         return 2
     except HarnessError as exc:
@@ -506,6 +646,7 @@ __all__ = [
     "HarnessError",
     "HostAdapter",
     "LockTimeoutError",
+    "ManagedMCPAdapter",
     "OutputLimitError",
     "PreparedGeneration",
     "ProcessCancelledError",
@@ -516,6 +657,7 @@ __all__ = [
     "RuntimeSelection",
     "__version__",
     "activate_runtime",
+    "configure_sharing",
     "inspect_profile",
     "maintain_runtime",
     "open_database",
@@ -524,7 +666,26 @@ __all__ = [
     "run_host",
     "run_owned",
     "serve_mcp",
+    "sharing_status",
+    "update_runtime",
 ]
+
+
+def __getattr__(name: str):
+    """Lazily expose optional management symbols without slowing cold import."""
+    if name == "ManagedMCPAdapter":
+        from .mcp.gateway import ManagedMCPAdapter
+
+        return ManagedMCPAdapter
+    if name in {"configure_sharing", "sharing_status"}:
+        from .sharing import configure_sharing, sharing_status
+
+        return {"configure_sharing": configure_sharing, "sharing_status": sharing_status}[name]
+    if name == "update_runtime":
+        from .runtime.wheelhouse import update_runtime
+
+        return update_runtime
+    raise AttributeError(name)
 
 if __name__ == "__main__":
     raise SystemExit(run_host())

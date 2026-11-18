@@ -1,10 +1,8 @@
 """Ledger-backed RSI optimization loop: composable actions with experiment-ledger authority.
-
 [Role]
 Coordinates `profile`, `consult`, `propose`, `measure`, `learn`, and one-shot `record`
 over `experiment-ledger.jsonl` (`SCHEMA = "mindie-rsi-loop/2"`). Runs 100% pure stdlib
 inside `mindie_harness.rsi` with zero `mindie_knowledge` runtime dependency.
-
 [Invariants]
 - `experiment-ledger.jsonl` is the authoritative fact store: `init` and `next_step`
   reconcile existing ledger history (`baseline`, `rounds`, `pending_distill`, `mode`),
@@ -16,10 +14,8 @@ inside `mindie_harness.rsi` with zero `mindie_knowledge` runtime dependency.
   after the gate.
 - `supported` / `subtarget_valid` advances the baseline; otherwise the next round
   reuses the profile and starts at `consult`.
-
 [Timeouts & Locks]
 - State mutations hold `<state>.lock` (`5.0s`), and ledger commits hold `<ledger>.lock` (`5.0s`).
-
 [Side-Effect Policy]
 - Writes only the loop state file, its lock, and the ledger + `PROGRESS.md` via `experiment_ledger.append`.
 """
@@ -27,7 +23,6 @@ from __future__ import annotations
 import argparse, json, math, os, subprocess, sys, time
 from pathlib import Path
 from typing import Any
-
 if __package__:
     from . import experiment_ledger as ledger
     from .rsi_crossover import normalize_parent_exp_ids, resolve_kept_anchor, resolve_measure_ablation_receipt, snapshot_parent_source_digests, suggest_orthogonal_crossovers
@@ -37,7 +32,6 @@ else:
     from mindie_harness.rsi import experiment_ledger as ledger
     from mindie_harness.rsi.rsi_crossover import normalize_parent_exp_ids, resolve_kept_anchor, resolve_measure_ablation_receipt, snapshot_parent_source_digests, suggest_orthogonal_crossovers
     from mindie_harness.rsi.support import assess_stagnation
-
 SCHEMA = "mindie-rsi-loop/2"
 STEPS = ("profile", "consult", "propose", "measure", "learn", "record")
 KEPT = frozenset({"supported", "subtarget_valid"})
@@ -51,7 +45,6 @@ MEASURE_OPTIONAL = (
     "reusable_scope", "require_reusable_scope",
 )
 _same_committed_experiment = ledger.same_committed_experiment
-
 GUIDE = {
     "profile": (
         "Hold an exclusive coordinator lease and run mindie_profiler with an explicit "
@@ -92,8 +85,6 @@ GUIDE = {
         "check. A kept gain without distill stays in pending_distill."
     ),
 }
-
-
 def _load(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise ValueError(f"{path} does not exist; run init first")
@@ -101,8 +92,6 @@ def _load(path: Path) -> dict[str, Any]:
     if state.get("schema") != SCHEMA:
         raise ValueError(f"{path} is not a {SCHEMA} state file")
     return state
-
-
 def _save(path: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     temporary = path.with_name(path.name + ".tmp")
@@ -115,8 +104,6 @@ def _save(path: Path, state: dict[str, Any]) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
-
-
 def _positive(value: Any, label: str, *, integer: bool = False, optional: bool = False) -> Any:
     if value is None and optional:
         return None
@@ -127,15 +114,11 @@ def _positive(value: Any, label: str, *, integer: bool = False, optional: bool =
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"{label} must be a positive number")
     return float(value)
-
-
 def _text(body: dict[str, Any], key: str) -> str:
     value = body.get(key)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be nonempty text")
     return value.strip()
-
-
 def _state_paths(state: dict[str, Any], state_path: Path | None = None) -> tuple[str, ...]:
     paths = [state["ledger"], state["progress"]]
     if state_path is not None:
@@ -143,8 +126,6 @@ def _state_paths(state: dict[str, Any], state_path: Path | None = None) -> tuple
     elif state.get("_state_path"):
         paths.append(str(state["_state_path"]))
     return tuple(paths)
-
-
 def _initial_baseline(state: dict[str, Any], live: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     init_base = state.get("initial_baseline")
     if isinstance(init_base, dict) and init_base.get("repo") and init_base.get("source_digest"):
@@ -154,8 +135,6 @@ def _initial_baseline(state: dict[str, Any], live: list[dict[str, Any]] | None =
         if first_src:
             return dict(repo=state["baseline"]["repo"], source_digest=first_src, exp_id=None)
     return dict(repo=state["baseline"]["repo"], source_digest=state["baseline"]["source_digest"], exp_id=None)
-
-
 def _expected_baseline(state: dict[str, Any], live: list[dict[str, Any]]) -> dict[str, Any]:
     init_base = _initial_baseline(state, live)
     if not live:
@@ -169,8 +148,6 @@ def _expected_baseline(state: dict[str, Any], live: list[dict[str, Any]]) -> dic
             exp_id=best_rec.get("exp_id") or best_rec.get("candidate_id"),
         )
     return init_base
-
-
 def _ledger_out_of_sync(state: dict[str, Any], live: list[dict[str, Any]]) -> bool:
     rounds = state.get("rounds") or []
     if len(live) != len(rounds):
@@ -192,8 +169,6 @@ def _ledger_out_of_sync(state: dict[str, Any], live: list[dict[str, Any]]) -> bo
         if verdict in KEPT and lesson.get("distill") is None:
             expected_pending.append(dict(round=idx, exp_id=rec.get("exp_id"), reason=lesson.get("note") or "not distilled yet"))
     return (state.get("pending_distill") or []) != expected_pending
-
-
 def _route_signature(record: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
     cond_key = json.dumps(record.get("conditions") or {}, sort_keys=True)
     units = tuple(
@@ -204,7 +179,6 @@ def _route_signature(record: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
         )
     )
     return cond_key, units
-
 
 def _stagnation(state: dict[str, Any]) -> dict[str, Any]:
     live, _ = ledger.fold(r for r in ledger.iter_ledger(state["ledger"], task_id=state["task_id"]) if r.get("task_id") == state["task_id"])
@@ -232,10 +206,8 @@ def _stagnation(state: dict[str, Any]) -> dict[str, Any]:
         entries.append(entry)
     return assess_stagnation(entries, consecutive_limit=STALL_WINDOW)
 
-
 def _finish(state: dict[str, Any], reason: str) -> None:
     state.update(status="finished", finish_reason=reason, step=None)
-
 
 def _sync_from_ledger(state: dict[str, Any], *, preserve_step: bool = False) -> None:
     """Reconcile state with pre-existing `experiment-ledger.jsonl` records."""
@@ -278,7 +250,6 @@ def _sync_from_ledger(state: dict[str, Any], *, preserve_step: bool = False) -> 
         else:
             state["step"] = "profile"
             state["current"] = dict(skipped=[])
-
 
 def _render_step(state: dict[str, Any]) -> dict[str, Any]:
     if state["status"] != "running":
@@ -334,7 +305,6 @@ def _render_step(state: dict[str, Any]) -> dict[str, Any]:
         )
     return result
 
-
 def init(path: str | Path, *, task_id: str, ledger_path: str | Path, baseline_repo: str | Path,
          direction: str, repetitions: int, target_speedup: float = ledger.DEFAULT_TARGET,
          max_rounds: int | None = None, max_runs: int | None = None,
@@ -366,7 +336,6 @@ def init(path: str | Path, *, task_id: str, ledger_path: str | Path, baseline_re
         _save(state_file, state)
     return _render_step(state)
 
-
 def next_step(path: str | Path) -> dict[str, Any]:
     state = _load(Path(path).resolve())
     if state["status"] == "running" and state["step"] != "learn":
@@ -375,14 +344,12 @@ def next_step(path: str | Path) -> dict[str, Any]:
             _sync_from_ledger(state, preserve_step=state["step"] in ("consult", "propose", "measure"))
     return _render_step(state)
 
-
 def _profile(state: dict[str, Any], body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if not isinstance(body.get("bottleneck_summary"), dict) or not body["bottleneck_summary"]:
         raise ValueError("bottleneck_summary must be a nonempty object from the profiler")
     state["current"].update(bottleneck_summary=body["bottleneck_summary"], profile_ref=_text(body, "profile_ref"))
     state["current"].pop("profile_reused_from", None)
     return "consult", {}
-
 
 def _consult(state: dict[str, Any], body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     req_mode = body.get("mode")
@@ -402,7 +369,6 @@ def _consult(state: dict[str, Any], body: dict[str, Any]) -> tuple[str, dict[str
     state["current"].update(unit_refs=refs, knowledge_mode=state["mode"], knowledge_skipped=skipped and skipped.strip())
     return "propose", {}
 
-
 def _resolve_anchor_baseline(state: dict[str, Any], anchor_id: str) -> dict[str, Any]:
     live, _ = ledger.fold(r for r in ledger.iter_ledger(state["ledger"], task_id=state["task_id"]) if r.get("task_id") == state["task_id"] and r.get("exp_id"))
     if anchor_id == "initial":
@@ -411,7 +377,6 @@ def _resolve_anchor_baseline(state: dict[str, Any], anchor_id: str) -> dict[str,
     if match is None:
         raise ValueError(f"anchor_baseline_exp_id {anchor_id!r} is not a kept candidate in ledger")
     return dict(repo=match.get("candidate_repo") or state["baseline"]["repo"], source_digest=match["source_digest"], exp_id=match["exp_id"])
-
 
 def _propose(state: dict[str, Any], body: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     current = state["current"]
@@ -460,7 +425,6 @@ def _propose(state: dict[str, Any], body: dict[str, Any]) -> tuple[str | None, d
         spent=decision["spent"])
     return "measure", dict(gate=decision)
 
-
 def _measure(state: dict[str, Any], body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     candidate = state["current"]["candidate"]
     now = ledger.fingerprint(candidate["repo"], exclude_paths=_state_paths(state))["source_digest"]
@@ -506,10 +470,8 @@ def _measure(state: dict[str, Any], body: dict[str, Any]) -> tuple[str, dict[str
         entry=entry)
     return "learn", dict(entry=entry)
 
-
 def _append_or_recover_learn(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     return ledger.append(state["ledger"], record, progress=state["progress"], goal=state["goal"], allow_idempotent_retry=True)
-
 
 def _learn(state: dict[str, Any], body: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     current = state["current"]
@@ -602,7 +564,6 @@ def _learn(state: dict[str, Any], body: dict[str, Any]) -> tuple[str | None, dic
     extra["next_mode"] = state["mode"]
     return upcoming, extra
 
-
 def _record(state: dict[str, Any], body: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     """Composable one-shot operation: propose + measure + learn without multi-step ceremony."""
     if "bottleneck_summary" in body and "profile_ref" in body:
@@ -658,9 +619,7 @@ def _record(state: dict[str, Any], body: dict[str, Any]) -> tuple[str | None, di
     upcoming, learn_extra = _learn(state, body)
     return upcoming, dict(**prop_extra, **meas_extra, **learn_extra)
 
-
 HANDLERS = dict(profile=_profile, consult=_consult, propose=_propose, measure=_measure, learn=_learn, record=_record)
-
 ALLOWED_STEPS_FROM = {
     "profile": frozenset({"profile", "consult", "propose", "record"}),
     "consult": frozenset({"profile", "consult", "propose", "record"}),
@@ -668,7 +627,6 @@ ALLOWED_STEPS_FROM = {
     "measure": frozenset({"propose", "measure", "record"}),
     "learn": frozenset({"learn"}),
 }
-
 
 def complete(path: str | Path, step: str, body: Any) -> tuple[dict[str, Any], int]:
     state_file = Path(path).resolve()
@@ -716,7 +674,6 @@ def complete(path: str | Path, step: str, body: Any) -> tuple[dict[str, Any], in
     code = BLOCKED if extra.get("blocked") else 1 if extra.get("error") else 0
     return dict(rendered, completed=step, **extra), code
 
-
 def finish(path: str | Path, reason: str) -> dict[str, Any]:
     state_file = Path(path).resolve()
     with ledger.exclusive_lock(state_file):
@@ -725,7 +682,6 @@ def finish(path: str | Path, reason: str) -> dict[str, Any]:
             _finish(state, reason)
             _save(state_file, state)
     return next_step(state_file)
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rsi_loop.py")
@@ -781,7 +737,6 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.buffer.write((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
     sys.stdout.buffer.flush()
     return code
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

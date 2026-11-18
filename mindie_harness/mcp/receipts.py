@@ -103,6 +103,8 @@ def process_boot_signature(pid: int) -> str | None:
         stat_file = Path(f"/proc/{pid}/stat")
         try:
             raw = stat_file.read_text(encoding="utf-8", errors="replace")
+        except TimeoutError:
+            raise
         except OSError:
             return None
         rparen = raw.rfind(")")
@@ -120,6 +122,8 @@ def process_boot_signature(pid: int) -> str | None:
         return None
     except PermissionError:
         return f"posix:{pid}:perm"
+    except TimeoutError:
+        raise
     except OSError:
         return None
 

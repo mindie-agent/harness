@@ -12,7 +12,8 @@ therefore importing ZERO sibling modules outside the Python standard library.
 - `render_plugin_bootstrap_template(host)` emits a `< 115`-line pure-stdlib plugin
   entrypoint that gates `Stop` / `SessionEnd` on saved sharing consent + authorized
   `project_roots` (`< 10ms` `{}` when disabled or out of scope, never cold-starting
-  runtimes on stale `admission.sqlite3`), fast-paths cold `pre-invocation` /
+  runtimes on stale `admission.sqlite3`), authorizes both `contribute` and
+  `local-only` tiers for local transcript capture, fast-paths cold `pre-invocation` /
   `user-prompt-submit` without prompt scanning, and verifies `seed-lock.json` before
   executing `mindie-harness-seed.pyz`.
 - Cold-start provisioning enforces a `2.5 GiB` disk floor, pins same-volume `UV_CACHE_DIR`,
@@ -42,7 +43,7 @@ import time
 from typing import Any
 
 SEED_LOCK_SCHEMA = "mindie-harness-seed/1"
-SEED_VERSION = "0.1.2"
+SEED_VERSION = "0.1.3"
 MIN_FREE_BYTES = int(2.5 * (1024 ** 3))
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _WIN_EXTS = (".exe", ".cmd", ".bat", ".com", ".ps1")
@@ -145,10 +146,10 @@ def _stop_roots(cfg_path: Path) -> list[str]:
     sp = Path(s) if isinstance(s := ((comm or {}).get("consent_config") or cfg.get("consent_config")), str) and os.path.isabs(s) else cfg_path.parent / "mindie-consent.json"
     cons = _read_json(sp)
     if comm is not None:
-        if comm.get("enabled") is not True or ((sp.exists() or isinstance(comm.get("consent_config"), str)) and (not cons or cons.get("enabled") is False or cons.get("choice", "contribute" if cons.get("enabled") is True else None) != "contribute")):
+        if comm.get("enabled") is not True or ((sp.exists() or isinstance(comm.get("consent_config"), str)) and (not cons or cons.get("enabled") is False or cons.get("choice", "contribute" if cons.get("enabled") is True else None) not in {"contribute", "local-only"})):
             return []
         roots = comm.get("project_roots")
-    elif not cp.exists() and cons and cons.get("enabled") is not False and (cons.get("enabled") is True or cons.get("choice") == "contribute"):
+    elif not cp.exists() and cons and cons.get("enabled") is not False and (cons.get("enabled") is True or cons.get("choice") in {"contribute", "local-only"}):
         roots = cons.get("project_roots")
     else:
         return []
@@ -197,6 +198,8 @@ def main() -> int:
     if op == "session-start" or "--offline" in os.environ.get("_MINDIE_UV_FLAGS", ""):
         try:
             _enqueue_pending_check(state_dir)
+        except TimeoutError:
+            raise
         except OSError:
             pass
         sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
@@ -230,6 +233,8 @@ def _is_win_store_stub(cand: Path) -> bool:
     if os.name == "nt":
         try:
             return cand.stat().st_size == 0
+        except TimeoutError:
+            raise
         except OSError:
             return True
     return False
@@ -252,6 +257,8 @@ def _which_native(name: str) -> str | None:
                 if fh.read(2) == b"MZ":
                     continue
             return str(cand)
+        except TimeoutError:
+            raise
         except OSError:
             continue
     return None
@@ -294,6 +301,8 @@ def _read_seed_json(path: Path) -> dict[str, Any] | None:
     try:
         data = json.loads(path.read_bytes().decode("utf-8-sig")) if path.is_file() else None
         return data if isinstance(data, dict) else None
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return None
 
@@ -564,12 +573,13 @@ def _seed_stop_roots(cfg_path: Path) -> list[str]:
         if (sp.exists() or isinstance(comm.get("consent_config"), str)) and (
             not cons
             or cons.get("enabled") is False
-            or cons.get("choice", "contribute" if cons.get("enabled") is True else None) != "contribute"
+            or cons.get("choice", "contribute" if cons.get("enabled") is True else None)
+            not in {"contribute", "local-only"}
         ):
             return []
         roots = comm.get("project_roots")
     elif not cp.exists() and cons and cons.get("enabled") is not False and (
-        cons.get("enabled") is True or cons.get("choice") == "contribute"
+        cons.get("enabled") is True or cons.get("choice") in {"contribute", "local-only"}
     ):
         roots = cons.get("project_roots")
     else:

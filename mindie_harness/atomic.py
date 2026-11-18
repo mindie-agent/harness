@@ -66,6 +66,8 @@ def atomic_write_bytes(path: str | Path, payload: bytes, *, mode: int = 0o600) -
     except BaseException:
         try:
             tmp_path.unlink(missing_ok=True)
+        except TimeoutError:
+            raise
         except OSError:
             pass
         raise
@@ -205,8 +207,6 @@ def _unlink_clearing_readonly(entry_path: Path, *, is_dir: bool) -> bool:
         return True
     except FileNotFoundError:
         return True
-    except TimeoutError:
-        raise
     except PermissionError:
         try:
             os.chmod(entry_path, stat.S_IWRITE | stat.S_IREAD | (stat.S_IEXEC if is_dir else 0))
@@ -219,6 +219,8 @@ def _unlink_clearing_readonly(entry_path: Path, *, is_dir: bool) -> bool:
             raise
         except OSError:
             return False
+    except TimeoutError:
+        raise
     except OSError:
         return False
 
@@ -246,6 +248,8 @@ def _remove_trash_tree_bounded(trash_dir: Path, deadline: float) -> bool:
                     entry_path = Path(entry.path)
                     try:
                         is_real_dir = entry.is_dir(follow_symlinks=False)
+                    except TimeoutError:
+                        raise
                     except OSError:
                         is_real_dir = False
                     if is_real_dir:

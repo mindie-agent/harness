@@ -141,6 +141,8 @@ def _try_lock_fd(fd: int, *, exclusive: bool) -> bool:
         return True
     except BlockingIOError:
         return False
+    except TimeoutError:
+        raise
     except OSError as exc:
         if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
             return False
@@ -258,6 +260,8 @@ class GenerationLease:
             if pos_fd is not None:
                 try:
                     _unlock_fd(pos_fd)
+                except TimeoutError:
+                    raise
                 except OSError:
                     pass
                 os.close(pos_fd)
@@ -265,6 +269,8 @@ class GenerationLease:
             if win_h is not None or pos_fd is not None:
                 try:
                     self.lease_path.unlink(missing_ok=True)
+                except TimeoutError:
+                    raise
                 except OSError:
                     pass
 
@@ -311,6 +317,8 @@ def acquire_generation_lease(generation_dir: str | Path) -> GenerationLease:
             _kernel32.CloseHandle(handle)
             try:
                 lease_path.unlink(missing_ok=True)
+            except TimeoutError:
+                raise
             except OSError:
                 pass
             raise
@@ -344,6 +352,8 @@ def acquire_generation_lease(generation_dir: str | Path) -> GenerationLease:
             os.close(fd)
             try:
                 lease_path.unlink(missing_ok=True)
+            except TimeoutError:
+                raise
             except OSError:
                 pass
             raise

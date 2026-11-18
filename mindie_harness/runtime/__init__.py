@@ -79,4 +79,18 @@ __all__ = [
     "select_python_abi",
     "version_satisfies",
     "write_pending_update_check",
+    "discover_channel",
+    "extract_wheel_bundle_safely",
+    "parse_sha256sums",
+    "stage_wheelhouse",
+    "update_runtime",
 ]
+
+
+def __getattr__(name: str):
+    """Lazily expose wheelhouse helpers without adding import-time cost."""
+    if name in {"discover_channel", "extract_wheel_bundle_safely", "parse_sha256sums", "stage_wheelhouse", "update_runtime"}:
+        from . import wheelhouse
+
+        return getattr(wheelhouse, name)
+    raise AttributeError(name)

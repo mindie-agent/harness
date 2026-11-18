@@ -10,16 +10,19 @@ and preserves Receipt Honesty when local accounting fails after primary success.
 - Never mutates global `os.environ` or `os.chdir()`; every call builds an isolated
   `RequestContext` (`session_id`, `cwd`, `env`, `deadline`, `cancel`).
 - Read-only / status / cancel tools (`is_readonly_or_control_tool`, including
-  `knowledge_query` and `knowledge_explain`) have ZERO artificial concurrency cap
-  (`AD-09` fixed) and zero replay-ledger lock contention.
+  `mindie_doctor`, `mindie_status`, `knowledge_query`, `knowledge_explain`, and the
+  case-accurate native read/poll/control names across all 7 host harnesses) have ZERO
+  artificial concurrency cap (`AD-09` fixed) and zero replay-ledger lock contention.
+- `remote_auth` is action-aware: `{"action": "status"}` is read-only, while `setup`
+  and `forget` remain mutation-accounted so SSH state changes get receipts.
 - All tools uniformly strip legacy optional `_mindie_bind_id`, `request_nonce`, and
   `context_file` from `inputSchema["required"]` and incoming arguments, falling back
   to `{host}-conn-{connection_id[:12]}` when host session metadata is absent.
 
 [Timeouts & Locks]
 - Enforces Principle 10 per-tool budgets (`remote_bash` `660s = 600s + 60s`,
-  `remote_write_stdin` `360s = 300s + 60s`, `components` `130s..660s`,
-  `knowledge` `45s = 35s + 10s` / `120s = 110s + 10s`).
+  `remote_write_stdin` `360s = 300s + 60s`, `mindie_doctor` `10s/15s + grace`,
+  `components` `130s..660s`, `knowledge` `45s = 35s + 10s` / `120s = 110s + 10s`).
 
 [Side-Effect Policy]
 - Dispatches validated tool invocations through the bound `HostAdapter` or handler map
@@ -41,6 +44,7 @@ import uuid
 from ..paths import HarnessError, ProfileRef
 from ..process.supervisor import Deadline, ProcessCancelledError
 from ..rsi import rsi_explore
+from .doctor import DOCTOR_TOOL_NAME, doctor_tool_definition, run_doctor_tool
 from .receipts import BindStore, RemoteReceipts, apply_receipt_honesty
 
 FORGED_IDENTITY_KEYS: frozenset[str] = frozenset(
@@ -59,13 +63,20 @@ CORRELATION_STRIP_KEYS: frozenset[str] = frozenset(
 
 REMOTE_NATIVE_MAX_WAIT_MS: dict[str, int] = {
     "remote_bash": 600_000,
+    "remote_Bash": 600_000,
     "remote_run_command": 600_000,
     "remote_write_stdin": 300_000,
     "remote_job_stdin": 300_000,
+    "remote_manage_task": 300_000,
+    "remote_TaskOutput": 600_000,
     "remote_exec_command": 30_000,
 }
 REMOTE_GRACE_SECONDS = 60.0
 REMOTE_MIN_BUDGET_SECONDS = 180.0
+
+DOCTOR_LOCAL_OUTER_SECONDS = 10.0
+DOCTOR_PROBE_OUTER_SECONDS = 20.0
+DOCTOR_CLEANUP_GRACE_SECONDS = 5.0
 
 READONLY_TOOL_PREFIXES: tuple[str, ...] = (
     "remote_read",
@@ -84,7 +95,27 @@ READONLY_TOOL_PREFIXES: tuple[str, ...] = (
     "remote_cancel",
     "remote_ping",
     "remote_hosts",
+    # Case-accurate Codex / Kimi / DSH native read, poll, and task-control tools.
+    "remote_Read",
+    "remote_Glob",
+    "remote_Grep",
+    "remote_TaskOutput",
+    "remote_TaskList",
+    "remote_TaskStop",
+    "remote_ViewImage",
+    "remote_ReadMediaFile",
+    # Antigravity / OpenCode native read, image, and probe tools (`remote_manage_task`
+    # is classified by `Action` in `is_readonly_tool_call` so `send_input` stays receipted).
+    "remote_view_image",
+    "remote_probe",
+    # Antigravity native read-only file and search tools.
+    "remote_read_file",
+    "remote_find_by_name",
+    "remote_grep_search",
+    "remote_list_dir",
+    # Diagnostics and harness status/control tools stay on the lock-free lane.
     "mindie_status",
+    "mindie_doctor",
     "mindie_interrupt",
     "npu_top",
     "diagnostics_status",
@@ -92,6 +123,9 @@ READONLY_TOOL_PREFIXES: tuple[str, ...] = (
     "knowledge_query",
     "knowledge_explain",
 )
+
+REMOTE_AUTH_READONLY_ACTIONS: frozenset[str] = frozenset({"status"})
+REMOTE_MANAGE_TASK_READONLY_ACTIONS: frozenset[str] = frozenset({"list", "status", "kill", "stop"})
 
 
 @dataclass(frozen=True)
@@ -120,6 +154,24 @@ def is_readonly_or_control_tool(name: str, tool_schema: Mapping[str, Any] | None
     return False
 
 
+def is_readonly_tool_call(
+    name: str,
+    arguments: Mapping[str, Any] | None = None,
+    tool_schema: Mapping[str, Any] | None = None,
+) -> bool:
+    """Classify a call as read-only/control, evaluating action-multiplexed tools first."""
+    clean = str(name or "").strip()
+    args = arguments if isinstance(arguments, Mapping) else {}
+    if clean == "remote_auth":
+        action = str(args.get("action") or "").strip().lower()
+        return action in REMOTE_AUTH_READONLY_ACTIONS
+    if clean == "remote_manage_task":
+        raw_action = args.get("Action") if "Action" in args else args.get("action")
+        action = str(raw_action or "").strip().lower()
+        return action in REMOTE_MANAGE_TASK_READONLY_ACTIONS
+    return is_readonly_or_control_tool(clean, tool_schema)
+
+
 def compute_tool_deadline(
     surface: str,
     tool_name: str,
@@ -129,10 +181,21 @@ def compute_tool_deadline(
 ) -> Deadline:
     """Compute Principle-10 outer `Deadline` (`outer >= inner + cleanup_grace`)."""
     args = arguments or {}
+
+    # Local diagnostics doctor: 5s inner local budget, +5s for an optional remote probe,
+    # plus cleanup grace. Read-only and lock-free, but still bounded end-to-end.
+    if tool_name == DOCTOR_TOOL_NAME:
+        probe_remote = args.get("probe_remote") is True
+        inner_sec = DOCTOR_PROBE_OUTER_SECONDS if probe_remote else DOCTOR_LOCAL_OUTER_SECONDS
+        outer = inner_sec + DOCTOR_CLEANUP_GRACE_SECONDS
+        if explicit_timeout is not None and float(explicit_timeout) > outer:
+            outer = float(explicit_timeout)
+        return Deadline.from_timeout(outer, cleanup_grace=DOCTOR_CLEANUP_GRACE_SECONDS)
+
     if surface == "remote" or tool_name.startswith("remote_"):
         native_ms = float(REMOTE_NATIVE_MAX_WAIT_MS.get(tool_name, 0))
         caller_ms = 0.0
-        for k in ("yield_time_ms", "timeout_ms"):
+        for k in ("yield_time_ms", "timeout_ms", "WaitMsBeforeAsync", "timeout"):
             val = args.get(k)
             if not isinstance(val, bool) and isinstance(val, (int, float)) and math.isfinite(val) and val > 0:
                 caller_ms = max(caller_ms, float(val))
@@ -319,7 +382,7 @@ class MCPRouter:
                 "required": [],
             },
         }
-        return [status_tool]
+        return [status_tool, doctor_tool_definition()]
 
     def list_tools(self) -> list[dict[str, Any]]:
         """Return normalized registered tools for `self.surface`."""
@@ -330,7 +393,10 @@ class MCPRouter:
         if not isinstance(params, Mapping):
             return True
         name = str(params.get("name") or "")
-        return is_readonly_or_control_tool(name, self._tool_map.get(name))
+        arguments = params.get("arguments")
+        if not isinstance(arguments, Mapping):
+            arguments = {}
+        return is_readonly_tool_call(name, arguments, self._tool_map.get(name))
 
     def _validate_and_clean_args(self, name: str, raw_args: Any) -> dict[str, Any]:
         if raw_args is None:
@@ -457,7 +523,7 @@ class MCPRouter:
             # Iron Rule 5 (P2.7 / P2.8): zero pre-call session binding across all surfaces!
             session_id = extracted_session or f"{self.profile.host}-conn-{self.connection_id[:12]}"
 
-            readonly = is_readonly_or_control_tool(name, self._tool_map.get(name))
+            readonly = is_readonly_tool_call(name, args, self._tool_map.get(name))
             if not readonly:
                 req_hash = hashlib.sha256(json.dumps(req_id, sort_keys=True).encode("utf-8")).hexdigest()[:24]
                 call_id = f"{self.connection_id}:{req_hash}"
@@ -513,6 +579,17 @@ class MCPRouter:
                     ],
                     "isError": False,
                 }
+            elif name == DOCTOR_TOOL_NAME and self._handler is None:
+                handler_started = True
+                doctor_args = dict(args)
+                if "cwd" not in doctor_args and ctx.cwd is not None:
+                    doctor_args["cwd"] = str(ctx.cwd)
+                result = run_doctor_tool(
+                    doctor_args,
+                    deadline=ctx.deadline,
+                    cancel=ctx.cancel,
+                    env=ctx.env,
+                )
             elif self._handler is not None:
                 handler_started = True
                 result = self._handler(ctx, args)

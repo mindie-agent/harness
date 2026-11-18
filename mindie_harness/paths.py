@@ -246,6 +246,8 @@ def open_wal_database(
         if create and os.name != "nt":
             try:
                 os.chmod(db_path, 0o600)
+            except TimeoutError:
+                raise
             except OSError:
                 pass
         conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")

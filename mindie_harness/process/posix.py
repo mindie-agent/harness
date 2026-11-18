@@ -114,6 +114,8 @@ def _kill_pgroup(pid: int, *, grace_seconds: float) -> list[dict[str, str]]:
         return issues
     except PermissionError as exc:
         issues.append({"stage": "sigterm_pg", "error_type": type(exc).__name__})
+    except TimeoutError:
+        raise
     except OSError as exc:
         if exc.errno != errno.ESRCH:
             issues.append({"stage": "sigterm_pg", "error_type": type(exc).__name__})
@@ -124,6 +126,8 @@ def _kill_pgroup(pid: int, *, grace_seconds: float) -> list[dict[str, str]]:
             os.killpg(pid, 0)
         except ProcessLookupError:
             return issues
+        except TimeoutError:
+            raise
         except OSError:
             break
         time.sleep(0.01)
@@ -132,6 +136,8 @@ def _kill_pgroup(pid: int, *, grace_seconds: float) -> list[dict[str, str]]:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except TimeoutError:
+        raise
     except OSError as exc:
         if exc.errno != errno.ESRCH:
             issues.append({"stage": "sigkill_pg", "error_type": type(exc).__name__})
@@ -307,16 +313,22 @@ def run_posix(
         if spool_file is not None:
             try:
                 spool_file.close()
+            except TimeoutError:
+                raise
             except OSError:
                 pass
         try:
             selector.close()
+        except TimeoutError:
+            raise
         except OSError:
             pass
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             try:
                 if stream and not stream.closed:
                     stream.close()
+            except TimeoutError:
+                raise
             except OSError:
                 pass
         if proc.poll() is None:

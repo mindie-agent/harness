@@ -5,7 +5,6 @@ Implements cross-platform PE header inspection (`read_pe_subsystem`, `verify_gui
 current-process Job constraint probing (`probe_current_job`), GUI null-stdio safety
 (`ensure_valid_stdio_streams`), and pure-`ctypes` `CreateProcessW` supervision (`run_win32`)
 attaching a non-inheritable nested Job Object BEFORE `ResumeThread`.
-
 [Invariants]
 - `CreateProcessW` ALWAYS passes `CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP`
   and NEVER passes `CREATE_NEW_CONSOLE` (`0x10`) or `DETACHED_PROCESS` (`0x08`), which
@@ -21,7 +20,6 @@ attaching a non-inheritable nested Job Object BEFORE `ResumeThread`.
 [Timeouts & Locks]
 - Pipe handle creation + `CreateProcessW(bInheritHandles=True)` is serialized under
   `_SPAWN_LOCK` so concurrent threads never leak inheritable pipe handles across children.
-
 [Side-Effect Policy]
 - Any failure prior to `ResumeThread` immediately calls `TerminateProcess` and closes
   all Job, process, thread, and pipe handles (`0` zombie processes or handle leaks).
@@ -40,7 +38,6 @@ import tempfile
 import threading
 import time
 from typing import IO, Any
-
 from ..paths import HarnessError
 from .supervisor import (
     Deadline,
@@ -54,7 +51,6 @@ from .supervisor import (
 IMAGE_SUBSYSTEM_WINDOWS_GUI = 2
 IMAGE_SUBSYSTEM_WINDOWS_CUI = 3
 _PE_OPT_MAGICS = frozenset({0x10B, 0x20B})  # PE32, PE32+
-
 CREATE_SUSPENDED = 0x00000004
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_CONSOLE = 0x00000010
@@ -73,7 +69,6 @@ JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001
 JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x00000004
-
 STARTF_USESTDHANDLES = 0x00000100
 HANDLE_FLAG_INHERIT = 0x00000001
 WAIT_OBJECT_0 = 0x00000000
@@ -83,16 +78,13 @@ ERROR_HANDLE_EOF = 38
 
 _SPAWN_LOCK = threading.Lock()
 
-
 @dataclass(frozen=True)
 class JobConstraintReport:
     """Measured Job Object constraints on the current host process."""
-
     in_job: bool
     breakaway_ok: bool
     memory_limit_bytes: int | None
     cpu_rate_capped: bool
-
 
 def read_pe_subsystem(exe_path: str | Path) -> int:
     """Read `IMAGE_OPTIONAL_HEADER.Subsystem` directly from a Windows PE executable."""
@@ -213,14 +205,12 @@ def ensure_valid_stdio_streams() -> None:
 if os.name == "nt":
     import ctypes
     from ctypes import wintypes
-
     class _SECURITY_ATTRIBUTES(ctypes.Structure):
         _fields_ = [
             ("nLength", wintypes.DWORD),
             ("lpSecurityDescriptor", ctypes.c_void_p),
             ("bInheritHandle", wintypes.BOOL),
         ]
-
     class _STARTUPINFOW(ctypes.Structure):
         _fields_ = [
             ("cb", wintypes.DWORD),
@@ -242,7 +232,6 @@ if os.name == "nt":
             ("hStdOutput", wintypes.HANDLE),
             ("hStdError", wintypes.HANDLE),
         ]
-
     class _PROCESS_INFORMATION(ctypes.Structure):
         _fields_ = [
             ("hProcess", wintypes.HANDLE),
@@ -250,7 +239,6 @@ if os.name == "nt":
             ("dwProcessId", wintypes.DWORD),
             ("dwThreadId", wintypes.DWORD),
         ]
-
     class _BASIC_LIMIT_INFO(ctypes.Structure):
         _fields_ = [
             ("PerProcessUserTimeLimit", ctypes.c_int64),
@@ -263,7 +251,6 @@ if os.name == "nt":
             ("PriorityClass", wintypes.DWORD),
             ("SchedulingClass", wintypes.DWORD),
         ]
-
     class _IO_COUNTERS(ctypes.Structure):
         _fields_ = [
             ("ReadOperationCount", ctypes.c_uint64),
@@ -273,7 +260,6 @@ if os.name == "nt":
             ("WriteTransferCount", ctypes.c_uint64),
             ("OtherTransferCount", ctypes.c_uint64),
         ]
-
     class _EXTENDED_LIMIT_INFO(ctypes.Structure):
         _fields_ = [
             ("BasicLimitInformation", _BASIC_LIMIT_INFO),
@@ -283,13 +269,11 @@ if os.name == "nt":
             ("PeakProcessMemoryUsed", ctypes.c_size_t),
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
-
     class _CPU_RATE_CONTROL_INFO(ctypes.Structure):
         _fields_ = [
             ("ControlFlags", wintypes.DWORD),
             ("CpuRate", wintypes.DWORD),
         ]
-
     _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _k32.GetCurrentProcess.argtypes = []
     _k32.GetCurrentProcess.restype = wintypes.HANDLE
@@ -368,7 +352,6 @@ def probe_current_job() -> JobConstraintReport:
     in_job = wintypes.BOOL(False)
     if not _k32.IsProcessInJob(_k32.GetCurrentProcess(), None, ctypes.byref(in_job)) or not in_job.value:
         return JobConstraintReport(in_job=False, breakaway_ok=True, memory_limit_bytes=None, cpu_rate_capped=False)
-
     ext = _EXTENDED_LIMIT_INFO()
     ret_len = wintypes.DWORD(0)
     breakaway_ok = False
@@ -389,7 +372,6 @@ def probe_current_job() -> JobConstraintReport:
             candidates.append(int(ext.JobMemoryLimit))
         if candidates:
             mem_limit = min(candidates)
-
     cpu_info = _CPU_RATE_CONTROL_INFO()
     cpu_capped = False
     if _k32.QueryInformationJobObject(
@@ -442,17 +424,14 @@ def run_win32(
     """Spawn a windowless Win32 child via `CreateProcessW`, attach nested Job before resume, and drain pipes."""
     if os.name != "nt":
         raise RuntimeError("run_win32 requires Windows (`os.name == 'nt'`)")
-
     if spec.effective_require_gui:
         verify_gui_subsystem(spec.argv[0])
-
     started = time.monotonic()
     child_env = build_child_env(spec.env)
     cmd_line = subprocess.list2cmdline(list(spec.argv))
     cmd_buf = ctypes.create_unicode_buffer(cmd_line)
     env_buf = _encode_unicode_env_block(child_env)
     cwd_str = str(spec.cwd) if spec.cwd is not None else None
-
     creation_flags = (
         CREATE_SUSPENDED
         | CREATE_NO_WINDOW
@@ -461,7 +440,6 @@ def run_win32(
     )
     if creation_flags & FORBIDDEN_CREATION_FLAGS:
         raise AssertionError("Forbidden Win32 console creation flags detected")
-
     spool_file: IO[bytes] | None = None
     spool_path: Path | None = None
     if spec.spool_dir is not None:
@@ -469,18 +447,15 @@ def run_win32(
         fd, raw_spool = tempfile.mkstemp(prefix="stdout-", suffix=".spool", dir=str(spec.spool_dir))
         spool_path = Path(raw_spool)
         spool_file = os.fdopen(fd, "w+b")
-
     stdin_w = stdout_r = stderr_r = 0
     stdin_r = stdout_w = stderr_w = 0
     proc_handle = thread_handle = job_handle = 0
     job_meta: dict[str, Any] = {}
-
     try:
         with _SPAWN_LOCK:
             stdin_w, stdin_r = _create_pipe_pair(child_reads=True)
             stdout_r, stdout_w = _create_pipe_pair(child_reads=False)
             stderr_r, stderr_w = _create_pipe_pair(child_reads=False)
-
             si = _STARTUPINFOW()
             si.cb = ctypes.sizeof(_STARTUPINFOW)
             si.dwFlags = STARTF_USESTDHANDLES
@@ -488,7 +463,6 @@ def run_win32(
             si.hStdOutput = stdout_w
             si.hStdError = stderr_w
             pi = _PROCESS_INFORMATION()
-
             ok = _k32.CreateProcessW(
                 None,
                 cmd_buf,
@@ -511,12 +485,10 @@ def run_win32(
             proc_handle = int(pi.hProcess)
             thread_handle = int(pi.hThread)
             child_pid = int(pi.dwProcessId)
-
         # Configure non-inheritable nested Job Object BEFORE ResumeThread!
         job_handle = int(_k32.CreateJobObjectW(None, None) or 0)
         if not job_handle:
             raise ctypes.WinError(ctypes.get_last_error())
-
         ext = _EXTENDED_LIMIT_INFO()
         limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if spec.memory_limit_bytes is not None:
@@ -526,7 +498,6 @@ def run_win32(
             limit_flags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS
             ext.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS
         ext.BasicLimitInformation.LimitFlags = limit_flags
-
         if not _k32.SetInformationJobObject(
             job_handle,
             JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -534,7 +505,6 @@ def run_win32(
             ctypes.sizeof(ext),
         ):
             raise ctypes.WinError(ctypes.get_last_error())
-
         cpu_pct = spec.effective_cpu_rate_percent
         cpu_applied = False
         if cpu_pct is not None:
@@ -549,16 +519,13 @@ def run_win32(
                     ctypes.sizeof(cpu_ctl),
                 )
             )
-
         if not _k32.AssignProcessToJobObject(job_handle, proc_handle):
             raise ctypes.WinError(ctypes.get_last_error())
-
         resumed = _k32.ResumeThread(thread_handle)
         if resumed == 0xFFFFFFFF:
             raise ctypes.WinError(ctypes.get_last_error())
         _k32.CloseHandle(thread_handle)
         thread_handle = 0
-
         job_meta = {
             "pid": child_pid,
             "kill_on_job_close": True,
@@ -609,14 +576,12 @@ def run_win32(
             reportable=False,
             details={"winerror": getattr(exc, "winerror", None), "error_type": type(exc).__name__},
         ) from exc
-
     stdout_buf = bytearray()
     stderr_buf = bytearray()
     cap_lock = threading.Lock()
     total_captured = 0
     reader_error: list[BaseException] = []
     cleanup_issues: list[dict[str, str]] = []
-
     def _writer_worker(handle: int, payload: bytes) -> None:
         try:
             mv = memoryview(payload)
@@ -629,7 +594,6 @@ def run_win32(
                 offset += int(written.value)
         finally:
             _k32.CloseHandle(handle)
-
     def _reader_worker(handle: int, is_stdout: bool) -> None:
         nonlocal total_captured
         buf = ctypes.create_string_buffer(65536)
@@ -658,7 +622,6 @@ def run_win32(
                         stdout_buf.extend(data)
                 else:
                     stderr_buf.extend(data)
-
     if spec.stdin_bytes:
         stdin_thread: threading.Thread | None = threading.Thread(
             target=_writer_worker, args=(stdin_w, spec.stdin_bytes), daemon=True
@@ -669,23 +632,19 @@ def run_win32(
         _k32.CloseHandle(stdin_w)
         stdin_w = 0
         stdin_thread = None
-
     t_out = threading.Thread(target=_reader_worker, args=(stdout_r, True), daemon=True)
     t_err = threading.Thread(target=_reader_worker, args=(stderr_r, False), daemon=True)
     t_out.start()
     t_err.start()
-
     def _terminate_job() -> None:
         nonlocal job_handle
         if job_handle:
             _k32.TerminateJobObject(job_handle, 1)
-
     def _exit_code() -> int | None:
         code = wintypes.DWORD(0)
         if _k32.GetExitCodeProcess(proc_handle, ctypes.byref(code)):
             return None if int(code.value) == 259 else int(code.value)
         return None
-
     def _build_outcome(execution: str, returncode: int | None) -> ProcessOutcome:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         with cap_lock:
@@ -711,7 +670,6 @@ def run_win32(
             cleanup_issues=tuple(cleanup_issues),
             job_metadata=dict(job_meta),
         )
-
     try:
         while True:
             if cancel is not None and cancel.is_set():
@@ -732,7 +690,6 @@ def run_win32(
                 if isinstance(first_err, RuntimeError) and str(first_err) == "output_limit_exceeded":
                     raise OutputLimitError(spec.max_output_bytes, _build_outcome("unknown", _exit_code()))
                 raise first_err
-
             rem = deadline.remaining()
             if rem <= 0.0:
                 _terminate_job()
@@ -742,7 +699,6 @@ def run_win32(
                 t_exc = TimeoutError("Owned Windows Job process exceeded monotonic deadline")
                 t_exc.outcome = _build_outcome("unknown", _exit_code())  # type: ignore[attr-defined]
                 raise t_exc
-
             wait_ms = max(1, min(25, int(rem * 1000)))
             state = _k32.WaitForSingleObject(proc_handle, wait_ms)
             if state == WAIT_OBJECT_0:
@@ -753,7 +709,6 @@ def run_win32(
                 if not t_out.is_alive() and not t_err.is_alive():
                     _terminate_job()
                     break
-
         grace_join = max(0.2, min(2.0, deadline.cleanup_grace))
         t_out.join(timeout=grace_join)
         t_err.join(timeout=grace_join)
@@ -761,19 +716,19 @@ def run_win32(
             stdin_thread.join(timeout=0.5)
         if t_out.is_alive() or t_err.is_alive():
             cleanup_issues.append({"stage": "join_reader", "error_type": "ReaderStillRunning"})
-
         if reader_error:
             first_err = reader_error[0]
             if isinstance(first_err, RuntimeError) and str(first_err) == "output_limit_exceeded":
                 raise OutputLimitError(spec.max_output_bytes, _build_outcome("unknown", _exit_code()))
             raise first_err
-
         rc = _exit_code()
         return _build_outcome("completed", 0 if rc is None else rc)
     finally:
         if spool_file is not None:
             try:
                 spool_file.close()
+            except TimeoutError:
+                raise
             except OSError:
                 pass
         if job_handle:

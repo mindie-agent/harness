@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindie-harness"
-version = "0.1.2"
+version = "0.1.3"
 description = "Standalone pure-stdlib shared plugin substrate, process/Job supervisor, atomic dual-generation runtime updater, concurrent MCP gateway, and RSI ledger engine for MindIE Agent"
 readme = "README.md"
 requires-python = ">=3.11"

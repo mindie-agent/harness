@@ -1,5 +1,4 @@
 """Source fingerprint, raw paired-trial check, 4-gate RSI judgment, and pre-device ledger gate.
-
 [Role]
 Identifies the exact source under test (`fingerprint`, linked-worktree safe),
 validates raw paired trials (`check_trials`), evaluates the 4-stage RSI candidate
@@ -8,7 +7,6 @@ launch-time `in_flight_runs` recovery state (`append`, `render_progress_file`),
 and blocks device submissions that repeat a settled source or exceed run /
 card-second budgets (`gate`). Runs 100% pure stdlib with zero `mindie_knowledge`
 or `mindie-bench` runtime dependency.
-
 [Invariants]
 - Supports both standard `.git/` checkouts and linked Git worktrees (`.git` file
   pointing to `gitdir: ...`), preventing uninitialized submodule directories inside
@@ -20,11 +18,9 @@ or `mindie-bench` runtime dependency.
 - `append` commits the JSONL ledger entry first, folds `supersedes_exp_id` revisions
   in-place, preserves recovery sections in `PROGRESS.md`, and reports
   `progress_unconfirmed=True` + `progress_warning` if `PROGRESS.md` fails.
-
 [Timeouts & Locks]
 - `fingerprint` bounds every `git` call (`15s`) and total scan (`60s`), streaming diffs.
 - `append` and `render_progress_file` hold `<ledger>.lock` (`5.0s`).
-
 [Side-Effect Policy]
 - Only `append` and `render_progress_file` write to disk (ledger JSONL + `PROGRESS.md`).
 """
@@ -32,7 +28,6 @@ from __future__ import annotations
 import argparse, contextlib, hashlib, json, math, os, re, statistics, subprocess, sys, tempfile, time
 from pathlib import Path
 from typing import Any, Iterator
-
 if __package__:
     from ..locks import exclusive_lock as _file_exclusive_lock
     from ..process.posix import which_posix_binary
@@ -54,7 +49,6 @@ else:
         flagged as _flagged, guard_regression as _guard_regression, merge_progress_markdown as _merge_progress,
         rank_supported_candidates as _rank_supported_candidates, render_managed_progress_body as _render_managed_progress_from_live,
     )
-
 SCHEMA_VERSION, EVALUATION_SCHEMA = "mindie-experiment-ledger/1", "mindie-rsi-evaluation/1"
 TASK_ARTIFACT_NAMES = frozenset({"rsi-loop.json", "rsi-loop.json.lock", "rsi-loop.json.tmp", "experiment-ledger.jsonl", "experiment-ledger.jsonl.lock", "experiment-ledger.jsonl.tmp", "PROGRESS.md", "PROGRESS.md.lock", "PROGRESS.md.tmp"})
 SETTLED = frozenset({"supported", "subtarget_valid", "refuted"})
@@ -67,17 +61,15 @@ LARGE_FILE_BYTES = 512 * 1024 * 1024
 LOCK_WAIT_SECONDS = 5.0
 DEFAULT_TARGET, DEFAULT_NOISE_MARGIN = 1.05, 0.01
 ARGUMENT_LIMIT, BLOCKED = 1024 * 1024, 3
-
-
 def has_git_marker(path: str | Path) -> bool:
     """Return True when `path/.git` exists as either a directory or a linked-worktree/submodule file."""
     dot_git = Path(path) / ".git"
     try:
         return dot_git.is_dir() or dot_git.is_file()
+    except TimeoutError:
+        raise
     except OSError:
         return False
-
-
 def resolve_git_worktree_info(repo: str | Path) -> dict[str, Any] | None:
     """Inspect `repo/.git` (directory or `gitdir:` file) and return worktree + commondir paths."""
     root = Path(repo).resolve()
@@ -88,6 +80,8 @@ def resolve_git_worktree_info(repo: str | Path) -> dict[str, Any] | None:
         return None
     try:
         raw = dot_git.read_text(encoding="utf-8-sig", errors="replace").strip()
+    except TimeoutError:
+        raise
     except OSError:
         return None
     if not raw.startswith("gitdir:"):
@@ -108,10 +102,11 @@ def resolve_git_worktree_info(repo: str | Path) -> dict[str, Any] | None:
             if rel_common:
                 cand_common = Path(rel_common)
                 commondir = cand_common.resolve() if cand_common.is_absolute() else (gitdir / cand_common).resolve()
+        except TimeoutError:
+            raise
         except OSError:
             pass
     return {"worktree": root, "gitdir": gitdir, "commondir": commondir, "is_linked_worktree": True}
-
 
 def _git_executable() -> str:
     if os.name != "nt":
@@ -119,7 +114,6 @@ def _git_executable() -> str:
         if found is not None:
             return str(found)
     return "git"
-
 
 def _git(repo: Path, *args: str, deadline: float, stdout: Any = subprocess.PIPE) -> bytes:
     timeout = min(GIT_TIMEOUT, deadline - time.monotonic())
@@ -131,7 +125,6 @@ def _git(repo: Path, *args: str, deadline: float, stdout: Any = subprocess.PIPE)
         raise ValueError(res.stderr.decode("utf-8", errors="replace").strip() or f"git {args[0]} failed")
     return res.stdout
 
-
 def _stream_digest(handle: Any, *, deadline: float | None = None) -> tuple[str, int]:
     digest, size = hashlib.sha256(), 0
     for block in iter(lambda: handle.read(1 << 20), b""):
@@ -141,7 +134,6 @@ def _stream_digest(handle: Any, *, deadline: float | None = None) -> tuple[str, 
         size += len(block)
     return digest.hexdigest(), size
 
-
 def _excluded_set(exclude_paths: Any) -> set[Path]:
     out: set[Path] = set()
     for raw in exclude_paths or ():
@@ -149,7 +141,6 @@ def _excluded_set(exclude_paths: Any) -> set[Path]:
             p = Path(raw).resolve()
             out.update((p, p.with_name(p.name + ".lock"), p.with_name(p.name + ".tmp")))
     return out
-
 
 def _is_task_artifact(path: Path) -> bool:
     if path.name in TASK_ARTIFACT_NAMES:
@@ -163,7 +154,6 @@ def _is_task_artifact(path: Path) -> bool:
         if b'"mindie-rsi-loop/' in peek or b'"mindie-experiment-ledger/' in peek:
             return True
     return False
-
 
 def _worktree_state(repo: Path, *, deadline: float, excluded_abs: set[Path] | frozenset[Path] = frozenset()) -> tuple[str, int, list[Any], list[str]]:
     rel_excludes = [f":(exclude){p.relative_to(repo).as_posix()}" for p in excluded_abs if p.is_relative_to(repo)]
@@ -192,7 +182,6 @@ def _worktree_state(repo: Path, *, deadline: float, excluded_abs: set[Path] | fr
         if time.monotonic() > deadline:
             raise subprocess.TimeoutExpired(["fingerprint", str(repo)], FINGERPRINT_TIMEOUT)
     return diff_sha256, diff_bytes, sorted(untracked), large
-
 
 def fingerprint(repo: str | Path, *, exclude_paths: Any = ()) -> dict[str, Any]:
     """Identify the exact source under test: HEAD, tracked diff, untracked files, submodules (worktree-safe)."""
@@ -233,18 +222,15 @@ def fingerprint(repo: str | Path, *, exclude_paths: Any = ()) -> dict[str, Any]:
         result["unhashed_large_files"] = sorted(large)
     return result
 
-
 def _number(value: Any, label: str, *, strict: bool = True) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or (value <= 0 if strict else value < 0):
         raise ValueError(f"{label} must be a {'positive' if strict else 'nonnegative'} number")
     return float(value)
 
-
 def _optional_bool(value: Any, label: str) -> bool | None:
     if value is not None and not isinstance(value, bool):
         raise ValueError(f"{label} must be a boolean or null")
     return value
-
 
 def _metric(trial: Any, label: str, index: int, problems: list[str]) -> float | None:
     if not isinstance(trial, dict) or trial.get("status") != "completed":
@@ -255,7 +241,6 @@ def _metric(trial: Any, label: str, index: int, problems: list[str]) -> float | 
         problems.append(f"{label} trial {index}: metric missing or not positive")
         return None
     return float(val)
-
 
 def check_trials(evidence: Any) -> dict[str, Any]:
     """Turn raw paired trials into the evidence flags, metrics, and ratio for RSI gates."""
@@ -316,7 +301,6 @@ def check_trials(evidence: Any) -> dict[str, Any]:
         problems=problems,
     )
 
-
 def _resolve_ablation_retained(ablation_retained: Any, ablation_receipt: Any) -> bool | None:
     retained = _optional_bool(ablation_retained, "ablation_retained")
     if ablation_receipt is None:
@@ -342,7 +326,6 @@ def _resolve_ablation_retained(ablation_retained: Any, ablation_receipt: Any) ->
         return receipt_retained
     return False if pruned_verified is True else retained
 
-
 def _ablation_retained(evidence: dict[str, Any]) -> bool | None:
     raw_ablation = evidence.get("ablation")
     raw_val = (
@@ -354,7 +337,6 @@ def _ablation_retained(evidence: dict[str, Any]) -> bool | None:
     if resolved is not None or any(k in evidence for k in ("ablation_retained", "ablation_ok", "ablation_passed", "ablation", "ablation_receipt")):
         return resolved
     return default_ablation_retained(evidence)
-
 
 def _gate3_status(
     resolved_ablation: bool | None,
@@ -383,7 +365,6 @@ def _gate3_status(
     if not scope_ok:
         return False, "reusable_scope_missing", extra_failed
     return (None, "ablation_pending", extra_failed) if resolved_ablation is None else (True, "", extra_failed)
-
 
 def evaluate_rsi_axes(
     *,
@@ -426,7 +407,6 @@ def evaluate_rsi_axes(
         if preserve_subtarget_evidence:
             return ("valid", "subtarget_valid", "speedup_below_target_valid_evidence", "not_attained", "reusable_observation", 4)
     return ("valid", "refuted", "speedup_below_target", "not_attained", "reusable_negative_boundary", 4)
-
 
 def evaluate_rsi_candidate_gates(
     *, run_id: str, candidate_id: str, mutation_summary: str, conditions: dict[str, Any] | None = None,
@@ -483,7 +463,6 @@ def evaluate_rsi_candidate_gates(
         "speedup_ratio": round(speedup, 6) if speedup is not None else None, "min_speedup_ratio": round(minimum, 6), "noise_margin": round(margin, 6), "gates": gates, "distill_ready": verdict in ("supported", "subtarget_valid"), "conditional_avoid": conditional_avoid, "failure_reason": reason_text,
     }
 
-
 def judge(evidence: dict[str, Any]) -> dict[str, Any]:
     """Check raw trials, then evaluate the 4-stage RSI candidate verification gates."""
     checked = check_trials(evidence)
@@ -514,7 +493,6 @@ def judge(evidence: dict[str, Any]) -> dict[str, Any]:
         entry["evidence_problems"] = checked["problems"]
     return entry
 
-
 def iter_ledger(path: str | Path, *, task_id: str | None = None) -> Iterator[dict[str, Any]]:
     """Stream JSONL ledger entries keeping $O(\\text{Active State})$ memory."""
     ledger_path = Path(path)
@@ -530,16 +508,13 @@ def iter_ledger(path: str | Path, *, task_id: str | None = None) -> Iterator[dic
                 if task_id is None or (isinstance(rec, dict) and (not rec.get("task_id") or rec.get("task_id") == task_id)):
                     yield rec
 
-
 def read_ledger(path: str | Path) -> list[dict[str, Any]]:
     return list(iter_ledger(path))
-
 
 @contextlib.contextmanager
 def exclusive_lock(path: str | Path) -> Iterator[None]:
     with _file_exclusive_lock(str(path) + ".lock", timeout=LOCK_WAIT_SECONDS):
         yield
-
 
 def validate(record: Any) -> dict[str, Any]:
     if not isinstance(record, dict):
@@ -564,7 +539,6 @@ def validate(record: Any) -> dict[str, Any]:
         if not isinstance(psd, dict) or any(not isinstance(k, str) or not k.strip() or not isinstance(v, str) for k, v in psd.items()):
             raise ValueError("parent_source_digests must map exp_id strings to source_digest strings")
     return record
-
 
 def fold(records: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Apply `supersedes_exp_id` revisions in-place so experiment timeline order is preserved."""
@@ -593,16 +567,13 @@ def fold(records: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         chain_seconds[key], last_raw_own[key] = seconds, (own_val if own_val is not None else prev_raw)
     return list(live.values()), dict(runs=len(seen), card_seconds=sum(chain_seconds.values()))
 
-
 def _render_managed_progress_body(entries: list[dict[str, Any]], *, campaign_id: str, goal: str = "") -> str:
     live, _ = fold(e for e in entries if isinstance(e, dict) and (not e.get("task_id") or e.get("task_id") == campaign_id))
     return _render_managed_progress_from_live(live, campaign_id=campaign_id, goal=goal)
 
-
 def render_progress(entries: list[dict[str, Any]], *, campaign_id: str, goal: str = "", existing_text: str | None = None) -> str:
     """Render `PROGRESS.md` for `campaign_id`, preserving recovery sections when present."""
     return _merge_progress(existing_text, _render_managed_progress_body(entries, campaign_id=campaign_id, goal=goal), campaign_id=campaign_id)
-
 
 def _write_progress_atomic(progress_path: Path, entries: list[dict[str, Any]], *, campaign_id: str, goal: str = "") -> None:
     progress_path.parent.mkdir(parents=True, exist_ok=True)
@@ -618,7 +589,6 @@ def _write_progress_atomic(progress_path: Path, entries: list[dict[str, Any]], *
         temp_path.unlink(missing_ok=True)
         raise
 
-
 def render_progress_file(path: str | Path, progress: str | Path | None = None, *, task_id: str, goal: str = "") -> dict[str, Any]:
     """Re-render `PROGRESS.md` from `experiment-ledger.jsonl` under the ledger lock."""
     ledger_path = Path(path)
@@ -628,11 +598,9 @@ def render_progress_file(path: str | Path, progress: str | Path | None = None, *
         _write_progress_atomic(progress_path, live, campaign_id=task_id, goal=goal)
     return dict(status="rendered", task_id=task_id, progress=str(progress_path))
 
-
 def same_committed_experiment(existing: dict[str, Any], candidate_record: dict[str, Any]) -> bool:
     keys = (set(existing) | set(candidate_record)) - LEARN_MUTABLE_KEYS
     return all(existing.get(k) == candidate_record.get(k) for k in keys)
-
 
 def _merge_idempotent_retry(existing: dict[str, Any], entry: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     if not same_committed_experiment(existing, entry):
@@ -656,7 +624,6 @@ def _merge_idempotent_retry(existing: dict[str, Any], entry: dict[str, Any]) -> 
         if flag in entry and existing.get(flag) != entry[flag]:
             merged[flag], needs_revision = entry[flag], True
     return merged, needs_revision
-
 
 def append(path: str | Path, record: dict[str, Any], *, progress: str | Path | None = None, goal: str = "", allow_idempotent_retry: bool = False) -> dict[str, Any]:
     """Validate, commit the ledger line, and atomically update `PROGRESS.md`."""
@@ -699,7 +666,6 @@ def append(path: str | Path, record: dict[str, Any], *, progress: str | Path | N
         result.update(progress_unconfirmed=True, progress_warning=progress_warning)
     return result
 
-
 def gate(
     path: str | Path,
     *,
@@ -731,13 +697,11 @@ def gate(
         return dict(decision="budget_exhausted", spent=spent, reason=f"{spent['card_seconds']:g} card-seconds recorded; budget is {max_card_seconds:g}")
     return dict(decision="submit", spent=spent)
 
-
 def _stdin_json() -> Any:
     raw = sys.stdin.buffer.read(ARGUMENT_LIMIT + 1)
     if len(raw) > ARGUMENT_LIMIT:
         raise ValueError("input exceeds 1 MiB")
     return json.loads(raw.decode("utf-8-sig"))
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="experiment_ledger.py")
@@ -777,7 +741,6 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.buffer.write((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
     sys.stdout.buffer.flush()
     return code
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
