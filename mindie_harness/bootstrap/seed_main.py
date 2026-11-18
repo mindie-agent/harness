@@ -184,6 +184,11 @@ def _enqueue_pending_check(state_dir: Path) -> None:
     tmp.write_text(json.dumps({"schema": "mindie-pending-update/1", "host": HOST, "reason": "session_start", "requested_at": time.time()}) + "\n", encoding="utf-8")
     os.replace(tmp, state_dir / "pending-update-check.json")
 
+def _io(buf: bytes | None) -> dict:
+    if buf is not None: return {"input": buf}
+    try: sys.stdin.fileno(); sys.stdout.fileno(); sys.stderr.fileno(); return {"stdin": sys.stdin, "stdout": sys.stdout, "stderr": sys.stderr}
+    except Exception: return {}
+
 def main() -> int:
     argv, cfg_path, state_dir = sys.argv[1:], _cfg_home() / f"{HOST}.json", _data_home() / "state" / HOST
     op, stdin_buf = (argv[1].lower().replace("_", "-") if len(argv) >= 2 and argv[0] == "hook" else ""), None
@@ -192,7 +197,7 @@ def main() -> int:
         if not roots or not _in_roots(stdin_buf := sys.stdin.buffer.read(1048577), roots):
             sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
     if (py := _active_python(cfg_path)) is not None:
-        return subprocess.run([str(py), "-I", "-X", "utf8", "-m", CLI_MOD, "--host", HOST, "--plugin-root", str(PLUGIN_ROOT), "--config", str(cfg_path), *argv], input=stdin_buf, creationflags=_NO_WIN).returncode
+        return subprocess.run([str(py), "-I", "-X", "utf8", "-m", CLI_MOD, "--host", HOST, "--plugin-root", str(PLUGIN_ROOT), "--config", str(cfg_path), *argv], **_io(stdin_buf), creationflags=_NO_WIN).returncode
     if op in {"pre-invocation", "user-prompt-submit"}:
         sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
     if op == "session-start" or "--offline" in os.environ.get("_MINDIE_UV_FLAGS", ""):
@@ -205,7 +210,7 @@ def main() -> int:
         sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
     pyz, lock = PLUGIN_ROOT / "assets" / "mindie-harness-seed.pyz", PLUGIN_ROOT / "assets" / "seed-lock.json"
     _verify_seed(pyz, lock)
-    return subprocess.run([sys.executable, "-I", "-X", "utf8", str(pyz), "--host", HOST, "--plugin-root", str(PLUGIN_ROOT), "--config", str(cfg_path), "--cli-module", CLI_MOD, *argv], input=stdin_buf, creationflags=_NO_WIN).returncode
+    return subprocess.run([sys.executable, "-I", "-X", "utf8", str(pyz), "--host", HOST, "--plugin-root", str(PLUGIN_ROOT), "--config", str(cfg_path), "--cli-module", CLI_MOD, *argv], **_io(stdin_buf), creationflags=_NO_WIN).returncode
 
 if __name__ == "__main__":
     raise SystemExit(main())
@@ -654,9 +659,16 @@ def main(argv: list[str] | None = None) -> int:
     if not rest:
         sys.stdout.write(json.dumps({"status": "provisioned", "python": str(py)}, sort_keys=True) + "\n")
         return 0
+    stdio_kw: dict[str, object] = {"input": stdin_buf} if stdin_buf is not None else {}
+    if stdin_buf is None:
+        try:
+            sys.stdin.fileno(); sys.stdout.fileno(); sys.stderr.fileno()
+            stdio_kw = {"stdin": sys.stdin, "stdout": sys.stdout, "stderr": sys.stderr}
+        except Exception:
+            pass
     proc = subprocess.run(
         [str(py), "-I", "-X", "utf8", "-m", known.cli_module, "--host", known.host, "--plugin-root", known.plugin_root, "--config", known.config, *rest],
-        input=stdin_buf,
+        **stdio_kw,
         creationflags=_CREATE_NO_WINDOW,
     )
     return proc.returncode
