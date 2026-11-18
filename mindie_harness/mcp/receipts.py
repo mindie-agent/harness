@@ -24,13 +24,15 @@ and `apply_receipt_honesty` (Principles 9 & 14).
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 import uuid
 
 from ..paths import HarnessError, open_wal_database
@@ -152,6 +154,20 @@ def is_owner_alive(owner_pid: int, owner_boot_sig: str) -> bool:
     return current_sig == owner_boot_sig
 
 
+@contextmanager
+def _hold_init_lock(lock: threading.Lock, *, deadline: float | None = None) -> Iterator[None]:
+    if deadline is None:
+        lock.acquire()
+    else:
+        rem = deadline - time.monotonic()
+        if rem <= 0 or not lock.acquire(timeout=rem):
+            raise TimeoutError("Timed out waiting for SQLite schema initialization lock")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 class RemoteReceipts:
     """SQLite WAL ledger preventing duplicate replay of mutating MCP requests."""
 
@@ -165,21 +181,28 @@ class RemoteReceipts:
         self.max_concurrent = max(1, int(max_concurrent))
         self.owner_pid = _SELF_PID
         self.owner_boot_sig = _SELF_BOOT_SIG
+        self._init_lock = threading.Lock()
         self._initialized = False
 
-    def _connect(self, *, deadline: float | None = None) -> sqlite3.Connection:
-        conn = open_wal_database(self.db_path, create=True, deadline=deadline)
-        assert conn is not None
-        if not self._initialized:
+    def _ensure_initialized(self, *, deadline: float | None = None) -> None:
+        if self._initialized and self.db_path.is_file():
+            return
+        with _hold_init_lock(self._init_lock, deadline=deadline):
+            if self._initialized and self.db_path.is_file():
+                return
+            init_conn = open_wal_database(self.db_path, create=True, deadline=deadline)
+            assert init_conn is not None
             try:
-                with conn:
-                    conn.execute(
+                init_conn.isolation_level = None
+                init_conn.execute("BEGIN IMMEDIATE")
+                try:
+                    init_conn.execute(
                         "CREATE TABLE IF NOT EXISTS authority("
                         "identity TEXT PRIMARY KEY, schema TEXT NOT NULL)"
                     )
-                    row = conn.execute("SELECT identity, schema FROM authority LIMIT 1").fetchone()
+                    row = init_conn.execute("SELECT identity, schema FROM authority LIMIT 1").fetchone()
                     if row is None:
-                        conn.execute(
+                        init_conn.execute(
                             "INSERT INTO authority(identity, schema) VALUES(?, ?)",
                             (uuid.uuid4().hex, RECEIPTS_SCHEMA_V2),
                         )
@@ -189,7 +212,7 @@ class RemoteReceipts:
                             stage="receipt_open",
                             reason="receipt_schema_mismatch",
                         )
-                    conn.execute(
+                    init_conn.execute(
                         "CREATE TABLE IF NOT EXISTS receipts_v2("
                         "call_id TEXT PRIMARY KEY, "
                         "session TEXT NOT NULL, "
@@ -201,20 +224,31 @@ class RemoteReceipts:
                         "started REAL NOT NULL, "
                         "updated REAL NOT NULL)"
                     )
-                    conn.execute(
+                    init_conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_receipts_v2_running "
                         "ON receipts_v2(session, status) WHERE status='running'"
                     )
                     # Reconcile any legacy v1 `attempts` running rows once on upgrade
-                    has_v1 = conn.execute(
+                    has_v1 = init_conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='attempts'"
                     ).fetchone()
                     if has_v1:
-                        conn.execute("UPDATE attempts SET status='unknown' WHERE status='running'")
-                self._initialized = True
-            except BaseException:
-                conn.close()
-                raise
+                        init_conn.execute("UPDATE attempts SET status='unknown' WHERE status='running'")
+                    init_conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        init_conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+            finally:
+                init_conn.close()
+            self._initialized = True
+
+    def _connect(self, *, deadline: float | None = None) -> sqlite3.Connection:
+        self._ensure_initialized(deadline=deadline)
+        conn = open_wal_database(self.db_path, create=True, deadline=deadline)
+        assert conn is not None
         return conn
 
     def claim(
@@ -315,16 +349,22 @@ class BindStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
+        self._init_lock = threading.Lock()
         self._initialized = False
 
-    def _connect(self, *, create: bool, deadline: float | None = None) -> sqlite3.Connection | None:
-        conn = open_wal_database(self.db_path, create=create, deadline=deadline)
-        if conn is None:
-            return None
-        if create and not self._initialized:
+    def _ensure_initialized(self, *, deadline: float | None = None) -> None:
+        if self._initialized and self.db_path.is_file():
+            return
+        with _hold_init_lock(self._init_lock, deadline=deadline):
+            if self._initialized and self.db_path.is_file():
+                return
+            init_conn = open_wal_database(self.db_path, create=True, deadline=deadline)
+            assert init_conn is not None
             try:
-                with conn:
-                    conn.execute(
+                init_conn.isolation_level = None
+                init_conn.execute("BEGIN IMMEDIATE")
+                try:
+                    init_conn.execute(
                         "CREATE TABLE IF NOT EXISTS binds("
                         "bind_id TEXT PRIMARY KEY, "
                         "session TEXT NOT NULL, "
@@ -336,15 +376,25 @@ class BindStore:
                         "created REAL NOT NULL, "
                         "updated REAL NOT NULL)"
                     )
-                    conn.execute(
+                    init_conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_binds_lookup "
                         "ON binds(tool, args_digest, status, created)"
                     )
-                self._initialized = True
-            except BaseException:
-                conn.close()
-                raise
-        return conn
+                    init_conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        init_conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+            finally:
+                init_conn.close()
+            self._initialized = True
+
+    def _connect(self, *, create: bool, deadline: float | None = None) -> sqlite3.Connection | None:
+        if create:
+            self._ensure_initialized(deadline=deadline)
+        return open_wal_database(self.db_path, create=create, deadline=deadline)
 
     def publish_bind(
         self,

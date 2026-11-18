@@ -554,3 +554,39 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
     assert post_to_res["isError"] is True
     assert post_to_res["structuredContent"]["reason"] == "helper_timeout"
     assert post_to_res["structuredContent"]["submission_state"] == "uncertain"
+
+    # 6. Cold-start concurrent initialization storm on `RemoteReceipts` and `BindStore` (zero `database is locked`).
+    from mindie_harness.mcp.receipts import BindStore, RemoteReceipts
+    import threading
+
+    cold_receipts = RemoteReceipts(tmp_path / "cold-storm" / "receipts.sqlite3", max_concurrent=16)
+    cold_binds = BindStore(tmp_path / "cold-storm" / "binds.sqlite3")
+    barrier = threading.Barrier(8)
+    storm_errors: list[BaseException] = []
+
+    def _storm_worker(idx: int) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            assert cold_receipts.claim(
+                f"call-{idx}",
+                session=f"sess-{idx}",
+                tool="remote_bash",
+                args_sha256=f"sha-{idx}",
+            )
+            cold_receipts.finish(f"call-{idx}", "succeeded")
+            cold_binds.publish_bind(
+                f"bind-{idx}",
+                session=f"sess-{idx}",
+                surface="remote",
+                tool="remote_bash",
+                args_digest=f"sha-{idx}",
+            )
+        except BaseException as exc:
+            storm_errors.append(exc)
+
+    threads = [threading.Thread(target=_storm_worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+    assert storm_errors == []
