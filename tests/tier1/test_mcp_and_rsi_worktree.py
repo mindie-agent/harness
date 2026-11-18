@@ -45,8 +45,23 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
             "name": "knowledge_query",
             "inputSchema": {
                 "type": "object",
-                "properties": {"query": {"type": "string"}, "mode": {"type": "string"}},
+                "properties": {
+                    "query": {"type": "string"},
+                    "mode": {"type": "string"},
+                    "request_nonce": {"type": "string"},
+                    "_mindie_bind_id": {"type": "string"},
+                    "context_file": {"type": "string"},
+                },
                 "required": ["query", "request_nonce", "_mindie_bind_id", "context_file"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "knowledge_explain",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"ref": {"type": "string"}},
+                "required": ["ref"],
                 "additionalProperties": False,
             },
         },
@@ -54,19 +69,25 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
             "name": "knowledge_distill",
             "inputSchema": {
                 "type": "object",
-                "properties": {"summary": {"type": "string"}},
+                "properties": {"summary": {"type": "string"}, "request_nonce": {"type": "string"}},
                 "required": ["summary", "request_nonce"],
                 "additionalProperties": False,
             },
         },
     ]
 
-    slow_entered = threading.Event()
+    slow_lock = threading.Lock()
+    slow_count = 0
+    both_mutations_blocked = threading.Event()
     release_slow = threading.Event()
 
     def _handler(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]:
+        nonlocal slow_count
         if ctx.tool_name == "remote_bash":
-            slow_entered.set()
+            with slow_lock:
+                slow_count += 1
+                if slow_count >= 2:
+                    both_mutations_blocked.set()
             while not release_slow.is_set():
                 if ctx.cancel.is_set():
                     return {"content": [{"type": "text", "text": "cancelled"}], "isError": True}
@@ -80,7 +101,7 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
     c2s_r, c2s_w = os.pipe()
     s2c_r, s2c_w = os.pipe()
     router = MCPRouter(profile, surface="all", tools=tools, handler=_handler)
-    server = MCPStdioServer(router)
+    server = MCPStdioServer(router, max_mutation_workers=2)
 
     srv_in = os.fdopen(c2s_r, "rb")
     srv_out = os.fdopen(s2c_w, "wb")
@@ -132,14 +153,21 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
         assert "request_nonce" not in read_schema["required"]
         kq_schema = next(t["inputSchema"] for t in list_resp["result"]["tools"] if t["name"] == "knowledge_query")
         assert kq_schema["required"] == ["query"]
+        assert set(kq_schema["properties"]) == {"query", "mode"}
 
-        # 2. Fire a slow foreground `remote_bash` AND while it blocks, fire 6 parallel `remote_read`, `remote_job_status` & `knowledge_query`!
-        write_mcp_message(
-            cli_out,
-            {"jsonrpc": "2.0", "id": "bash-slow", "method": "tools/call", "params": {"name": "remote_bash", "arguments": {"cmd": "sleep 10"}}},
-            "jsonl",
-        )
-        assert slow_entered.wait(timeout=3.0)
+        # 2. Saturate ALL `max_mutation_workers=2` threads with two concurrent `remote_bash` calls!
+        for slow_idx in (1, 2):
+            write_mcp_message(
+                cli_out,
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"bash-slow-{slow_idx}",
+                    "method": "tools/call",
+                    "params": {"name": "remote_bash", "arguments": {"cmd": f"sleep {slow_idx}"}},
+                },
+                "jsonl",
+            )
+        assert both_mutations_blocked.wait(timeout=3.0)
 
         for i in range(6):
             write_mcp_message(
@@ -157,8 +185,13 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
             {"jsonrpc": "2.0", "id": "kq-fastlane", "method": "tools/call", "params": {"name": "knowledge_query", "arguments": {"query": "tiling", "mode": "explore"}}},
             "jsonl",
         )
+        write_mcp_message(
+            cli_out,
+            {"jsonrpc": "2.0", "id": "ke-fastlane", "method": "tools/call", "params": {"name": "knowledge_explain", "arguments": {"ref": "mindie://unit/1"}}},
+            "content-length",
+        )
 
-        # All 6 parallel reads (>4 old cap!) + status + read-only knowledge_query MUST complete while `bash-slow` is STILL running!
+        # With BOTH mutation workers blocked, all 6 reads + status + knowledge_query + knowledge_explain MUST finish on the fast lane!
         for i in range(6):
             r_msg, r_fmt = _wait_id(f"read-{i}", timeout=2.0)
             assert r_fmt == ("content-length" if i % 2 == 0 else "jsonl")
@@ -168,12 +201,19 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
         kqf_msg, _ = _wait_id("kq-fastlane", timeout=2.0)
         assert kqf_msg["result"]["isError"] is False
         assert f"knowledge_query:ok:oc-conn-{router.connection_id[:12]}" in kqf_msg["result"]["content"][0]["text"]
-        assert "bash-slow" not in responses  # Proof they didn't wait for bash-slow!
+        kef_msg, kef_fmt = _wait_id("ke-fastlane", timeout=2.0)
+        assert kef_fmt == "content-length"
+        assert kef_msg["result"]["isError"] is False
+        assert f"knowledge_explain:ok:oc-conn-{router.connection_id[:12]}" in kef_msg["result"]["content"][0]["text"]
+        assert "bash-slow-1" not in responses and "bash-slow-2" not in responses
 
-        # 3. Cancel `bash-slow` via `notifications/cancelled`
-        write_mcp_message(cli_out, {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "bash-slow"}}, "jsonl")
-        bash_msg, _ = _wait_id("bash-slow", timeout=2.0)
-        assert bash_msg["result"]["isError"] is True
+        # 3. Cancel `bash-slow-1` via `notifications/cancelled`, then release `bash-slow-2`
+        write_mcp_message(cli_out, {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "bash-slow-1"}}, "jsonl")
+        bash1_msg, _ = _wait_id("bash-slow-1", timeout=2.0)
+        assert bash1_msg["result"]["isError"] is True
+        release_slow.set()
+        bash2_msg, _ = _wait_id("bash-slow-2", timeout=2.0)
+        assert bash2_msg["result"]["isError"] is False
 
         # 4. Silent default-on (`P2.7` / `P2.8`) cold-start `knowledge_*` with zero `_meta` & zero `admission.sqlite3`
         write_mcp_message(

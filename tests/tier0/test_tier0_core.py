@@ -287,6 +287,9 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
                 "properties": {
                     "query": {"type": "string"},
                     "mode": {"type": "string"},
+                    "request_nonce": {"type": "string"},
+                    "_mindie_bind_id": {"type": "string"},
+                    "context_file": {"type": "string"},
                 },
                 "required": ["query", "request_nonce", "_mindie_bind_id", "context_file"],
                 "additionalProperties": False,
@@ -305,7 +308,7 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
             "name": "knowledge_distill",
             "inputSchema": {
                 "type": "object",
-                "properties": {"summary": {"type": "string"}},
+                "properties": {"summary": {"type": "string"}, "request_nonce": {"type": "string"}},
                 "required": ["summary", "request_nonce"],
                 "additionalProperties": False,
             },
@@ -331,7 +334,12 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
             "name": "coordinator",
             "inputSchema": {
                 "type": "object",
-                "properties": {"argv": {"type": "array"}},
+                "properties": {
+                    "argv": {"type": "array"},
+                    "context_file": {"type": "string"},
+                    "_mindie_bind_id": {"type": "string"},
+                    "request_nonce": {"type": "string"},
+                },
                 "required": ["argv", "context_file", "_mindie_bind_id", "request_nonce"],
                 "additionalProperties": False,
             },
@@ -339,8 +347,11 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
     ]
 
     seen_calls: list[tuple[str, str, Path | None, dict[str, object]]] = []
+    raise_in_handler = False
 
     def _handler(ctx: RequestContext, args: dict[str, object]) -> dict[str, object]:
+        if raise_in_handler:
+            raise TimeoutError("simulated in-flight tool timeout after dispatch")
         seen_calls.append((ctx.tool_name, ctx.session_id, ctx.cwd, dict(args)))
         return {
             "content": [{"type": "text", "text": json.dumps({"tool": ctx.tool_name, "session_id": ctx.session_id})}],
@@ -349,19 +360,42 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
 
     assert CORRELATION_STRIP_KEYS == frozenset({"_mindie_bind_id", "request_nonce", "context_file"})
 
-    # 1. Cold-start discovery across `knowledge`, `tools`, and `all` exposes all tools & strips correlation keys.
+    # 0. Explicit `tools=[]` stays empty, whereas `tools=None` defaults to `[mindie_status]`.
+    assert MCPRouter(profile, surface="tools", tools=[], base_env={}).list_tools() == []
+    assert [t["name"] for t in MCPRouter(profile, surface="tools", tools=None, base_env={}).list_tools()] == ["mindie_status"]
+
+    # 1. Single-point normalization in `__init__` strips CORRELATION_STRIP_KEYS from `properties` AND `required`.
     for surface in ("knowledge", "tools", "all"):
         r = MCPRouter(profile, surface=surface, tools=tools, handler=_handler, base_env={})
         listed = r.list_tools()
         assert [t["name"] for t in listed] == [t["name"] for t in tools]
         for item in listed:
+            prop_fields = set(item.get("inputSchema", {}).get("properties") or ())
             req_fields = set(item.get("inputSchema", {}).get("required") or ())
+            assert prop_fields.isdisjoint(CORRELATION_STRIP_KEYS), (surface, item["name"], prop_fields)
             assert req_fields.isdisjoint(CORRELATION_STRIP_KEYS), (surface, item["name"], req_fields)
     assert not profile.admission_db.exists()
 
-    # 2. Cold-start `call_tool()` on `surface="knowledge"` with zero `_meta`, zero `request_nonce`, zero `_mindie_bind_id`.
+    # 2. Cold-start `call_tool()` on `surface="knowledge"` with zero `_meta` skips `claim_bind` SQLite lock completely.
     router = MCPRouter(profile, surface="knowledge", tools=tools, handler=_handler, base_env={})
     expected_fallback = f"codex-conn-{router.connection_id[:12]}"
+
+    bind_cwd = tmp_path / "victim-proj"
+    bind_cwd.mkdir()
+    real_claim_bind = router.binds.claim_bind
+    router.binds.publish_bind(
+        "victim-bind-1",
+        session="victim-sess",
+        surface="knowledge",
+        tool="knowledge_explain",
+        args_digest="unused",
+        cwd=str(bind_cwd),
+    )
+
+    def _forbid_anonymous_claim_bind(**_kwargs: object) -> None:
+        pytest.fail("claim_bind must never be called when both _meta bind_id and session are absent")
+
+    monkeypatch.setattr(router.binds, "claim_bind", _forbid_anonymous_claim_bind)
 
     q_res = router.call_tool(
         {
@@ -392,7 +426,7 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
     assert bad_rsi["isError"] is True
     assert bad_rsi["structuredContent"]["reason"] == "invalid_rsi_arguments"
 
-    # Legacy correlation keys in arguments are stripped uniformly (even under additionalProperties=False).
+    # Model-supplied `_mindie_bind_id` in `arguments` is stripped and NEVER used to claim `victim-bind-1`!
     e_res = router.call_tool(
         {
             "jsonrpc": "2.0",
@@ -403,7 +437,7 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
                 "arguments": {
                     "ref": "mindie://unit/1",
                     "request_nonce": "legacy-nonce",
-                    "_mindie_bind_id": "legacy-bind",
+                    "_mindie_bind_id": "victim-bind-1",
                     "context_file": "/tmp/legacy-ctx.json",
                 },
             },
@@ -417,6 +451,28 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
         rsi_explore.parse_args({"ref": "mindie://unit/1"}),
     )
     assert not profile.receipts_db.exists()
+
+    # Host-supplied `_meta.bind_id` DOES claim the pending bind and enrich `session_id` + `cwd`.
+    monkeypatch.setattr(router.binds, "claim_bind", real_claim_bind)
+    meta_bind_res = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "ke-meta-bind",
+            "method": "tools/call",
+            "params": {
+                "name": "knowledge_explain",
+                "arguments": {"ref": "mindie://unit/1"},
+                "_meta": {"bind_id": "victim-bind-1"},
+            },
+        }
+    )
+    assert meta_bind_res["isError"] is False
+    assert seen_calls[-1] == (
+        "knowledge_explain",
+        "victim-sess",
+        bind_cwd,
+        rsi_explore.parse_args({"ref": "mindie://unit/1"}),
+    )
 
     # 3. Non-readonly mutating `knowledge_*` tools succeed on cold start & enforce idempotent RemoteReceipts.
     for idx, (tname, targs) in enumerate(
@@ -464,19 +520,37 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
             assert forged_res["isError"] is True
             assert forged_res["structuredContent"]["reason"] == "forged_identity_argument"
 
-    # 5. Principle 14: `TimeoutError` during optional `binds.claim_bind` propagates as timeout, never swallowed as OSError.
+    # 5. Principle 14 + Iron Rule 2: pre-dispatch `TimeoutError` -> `not_sent`; post-dispatch `TimeoutError` -> `uncertain`.
     def _timeout_claim_bind(**_kwargs: object) -> None:
         raise TimeoutError("simulated bind SQLite deadline exceeded")
 
     monkeypatch.setattr(router.binds, "claim_bind", _timeout_claim_bind)
-    to_res = router.call_tool(
+    pre_to_res = router.call_tool(
         {
             "jsonrpc": "2.0",
-            "id": "kq-timeout",
+            "id": "kq-pre-timeout",
+            "method": "tools/call",
+            "params": {
+                "name": "knowledge_query",
+                "arguments": {"query": "x"},
+                "_meta": {"session_id": "s-pre-timeout"},
+            },
+        }
+    )
+    assert pre_to_res["isError"] is True
+    assert pre_to_res["structuredContent"]["reason"] == "helper_timeout"
+    assert pre_to_res["structuredContent"]["submission_state"] == "not_sent"
+
+    monkeypatch.setattr(router.binds, "claim_bind", real_claim_bind)
+    raise_in_handler = True
+    post_to_res = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "kq-post-timeout",
             "method": "tools/call",
             "params": {"name": "knowledge_query", "arguments": {"query": "x"}},
         }
     )
-    assert to_res["isError"] is True
-    assert to_res["structuredContent"]["reason"] == "helper_timeout"
-    assert to_res["structuredContent"]["submission_state"] == "uncertain"
+    assert post_to_res["isError"] is True
+    assert post_to_res["structuredContent"]["reason"] == "helper_timeout"
+    assert post_to_res["structuredContent"]["submission_state"] == "uncertain"

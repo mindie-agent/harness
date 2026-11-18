@@ -10,9 +10,11 @@ therefore importing ZERO sibling modules outside the Python standard library.
 - Verifies `mindie-harness-seed.pyz` SHA-256 and byte size in `64 KiB` chunks against
   `seed-lock.json` (`schema: "mindie-harness-seed/1"`).
 - `render_plugin_bootstrap_template(host)` emits a `< 115`-line pure-stdlib plugin
-  entrypoint that fast-paths unactivated `Stop` / non-gesture hooks in `< 10ms` (`{}`),
-  never triggers cold builds or network I/O on passive `Stop`, and verifies `seed-lock.json`
-  before executing `mindie-harness-seed.pyz`.
+  entrypoint that gates `Stop` / `SessionEnd` on saved sharing consent + authorized
+  `project_roots` (`< 10ms` `{}` when disabled or out of scope, never cold-starting
+  runtimes on stale `admission.sqlite3`), fast-paths cold `pre-invocation` /
+  `user-prompt-submit` without prompt scanning, and verifies `seed-lock.json` before
+  executing `mindie-harness-seed.pyz`.
 - Cold-start provisioning enforces a `2.5 GiB` disk floor, pins same-volume `UV_CACHE_DIR`,
   skips WSL2 `.exe`/`MZ` shims and Windows `WindowsApps` Store stubs, and serializes
   concurrent cold starts under `.prepare-<host>.lock`.
@@ -98,37 +100,36 @@ def render_plugin_bootstrap_template(host: str, *, cli_module: str = "mindie_har
     clean_host = str(host).strip().lower()
     if clean_host not in {"codex", "cc", "kimi", "dsh", "agy", "wb", "oc"}:
         raise ValueError(f"Unsupported host: {host!r}")
-    template = f'''#!/usr/bin/env python3
-"""Deterministic stdlib cold-start launcher for MindIE ({clean_host})."""
+    raw_template = r'''#!/usr/bin/env python3
+"""Deterministic stdlib cold-start launcher for MindIE (__HOST_LABEL__)."""
 from __future__ import annotations
 import hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
-HOST, CLI_MOD = {clean_host!r}, {cli_module!r}
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+HOST, CLI_MOD, PLUGIN_ROOT = __HOST__, __CLI_MOD__, Path(__file__).resolve().parents[1]
 _NO_WIN = 0x08000000 if os.name == "nt" else 0
 
 def _cfg_home() -> Path:
     if v := os.environ.get("MINDIE_CONFIG_HOME"):
         return Path(v)
-    base = os.environ.get("APPDATA") or (Path.home() / "AppData/Roaming") if os.name == "nt" else os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
-    return Path(base) / "mindie-agent"
+    return Path(os.environ.get("APPDATA") or (Path.home() / "AppData/Roaming") if os.name == "nt" else os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "mindie-agent"
 
 def _data_home() -> Path:
     if v := os.environ.get("MINDIE_DATA_HOME"):
         return Path(v)
-    base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData/Local") if os.name == "nt" else os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share")
-    return Path(base) / "mindie-agent"
+    return Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData/Local") if os.name == "nt" else os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share")) / "mindie-agent"
 
 def _read_json(p: Path) -> dict | None:
     try:
-        return json.loads(p.read_bytes().decode("utf-8-sig")) if p.is_file() else None
+        return d if p.is_file() and isinstance(d := json.loads(p.read_bytes().decode("utf-8-sig")), dict) else None
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return None
 
 def _verify_seed(pyz: Path, lock: Path) -> None:
     doc = _read_json(lock)
-    if not isinstance(doc, dict) or doc.get("schema") != "mindie-harness-seed/1":
+    if not doc or doc.get("schema") != "mindie-harness-seed/1":
         raise SystemExit("Invalid seed-lock.json")
     h, sz = hashlib.sha256(), 0
     with pyz.open("rb") as fh:
@@ -137,53 +138,68 @@ def _verify_seed(pyz: Path, lock: Path) -> None:
     if sz != doc.get("size_bytes") or h.hexdigest() != doc.get("sha256"):
         raise SystemExit("mindie-harness-seed.pyz SHA-256 mismatch")
 
-def _passive_fast_noop(argv: list[str], state_dir: Path) -> tuple[bytes | None, bytes | None]:
-    if len(argv) < 2 or argv[0] != "hook":
-        return None, None
-    op, admitted = argv[1], (state_dir / "admission.sqlite3").is_file()
-    if op == "stop" and not admitted:
-        return b"{{}}\\n", None
-    if op in {{"pre-invocation", "user-prompt-submit"}} and not admitted:
-        raw = sys.stdin.buffer.read(33554433)
-        if b"mindie-agent" not in raw:
-            return b"{{}}\\n", None
-        return None, raw
-    return None, None
+def _stop_roots(cfg_path: Path) -> list[str]:
+    cfg = _read_json(cfg_path) or {}
+    cp = Path(c) if isinstance(c := cfg.get("community_config"), str) and os.path.isabs(c) else cfg_path.parent / "mindie-community.json"
+    comm = _read_json(cp)
+    sp = Path(s) if isinstance(s := ((comm or {}).get("consent_config") or cfg.get("consent_config")), str) and os.path.isabs(s) else cfg_path.parent / "mindie-consent.json"
+    cons = _read_json(sp)
+    if comm is not None:
+        if comm.get("enabled") is not True or ((sp.exists() or isinstance(comm.get("consent_config"), str)) and (not cons or cons.get("enabled") is False or cons.get("choice", "contribute" if cons.get("enabled") is True else None) != "contribute")):
+            return []
+        roots = comm.get("project_roots")
+    elif not cp.exists() and cons and cons.get("enabled") is not False and (cons.get("enabled") is True or cons.get("choice") == "contribute"):
+        roots = cons.get("project_roots")
+    else:
+        return []
+    return [os.path.normcase(str(Path(r).resolve())) for r in roots] if isinstance(roots, list) and roots and all(isinstance(r, str) and os.path.isabs(r) for r in roots) else []
+
+def _in_roots(raw: bytes, roots: list[str]) -> bool:
+    try:
+        ev = json.loads(raw.decode("utf-8-sig")) if 0 < len(raw) <= 1048576 and raw.strip() else None
+    except ValueError:
+        ev = None
+    if not isinstance(ev, dict):
+        return False
+    cands = [ev.get(k) for k in ("cwd", "workspace", "workspace_root", "project_root", "directory")] + (wps if isinstance(wps := ev.get("workspacePaths"), list) else [])
+    for ws in cands:
+        if isinstance(ws, str) and os.path.isabs(ws):
+            c = os.path.normcase(str(Path(ws).resolve()))
+            if any(os.path.commonpath([c, r]) == r for r in roots if os.path.splitdrive(c)[0] == os.path.splitdrive(r)[0]):
+                return True
+    return False
 
 def _active_python(cfg_path: Path) -> Path | None:
-    cfg = _read_json(cfg_path)
-    if isinstance(cfg, dict):
-        rel = cfg.get("component_release")
-        if isinstance(rel, str) and rel:
-            rj = _read_json(Path(rel) / "runtime.json")
-            if isinstance(rj, dict) and (rj.get("validation") or {{}}).get("status") == "validated":
-                py = Path(str(rj.get("python") or ""))
-                if py.is_file():
-                    return py
+    if cfg := _read_json(cfg_path):
+        if isinstance(rel := cfg.get("component_release"), str) and rel and (rj := _read_json(Path(rel) / "runtime.json")) and (rj.get("validation") or {}).get("status") == "validated" and Path(str(rj.get("python") or "")).is_file():
+            return Path(str(rj["python"]))
         if isinstance(cfg.get("python"), str) and Path(cfg["python"]).is_file():
             return Path(cfg["python"])
     return None
 
 def _enqueue_pending_check(state_dir: Path) -> None:
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = state_dir / f".pending.tmp.{{os.getpid()}}"
-    tmp.write_text(json.dumps({{"schema": "mindie-pending-update/1", "host": HOST, "reason": "session_start", "requested_at": time.time()}}) + "\\n", encoding="utf-8")
+    tmp = state_dir / f".pending.tmp.{os.getpid()}"
+    tmp.write_text(json.dumps({"schema": "mindie-pending-update/1", "host": HOST, "reason": "session_start", "requested_at": time.time()}) + "\n", encoding="utf-8")
     os.replace(tmp, state_dir / "pending-update-check.json")
 
 def main() -> int:
-    argv, cfg_path, state_dir = sys.argv[1:], _cfg_home() / f"{{HOST}}.json", _data_home() / "state" / HOST
-    fast, stdin_buf = _passive_fast_noop(argv, state_dir)
-    if fast is not None:
-        sys.stdout.buffer.write(fast); sys.stdout.buffer.flush(); return 0
-    py = _active_python(cfg_path)
-    if py is not None:
+    argv, cfg_path, state_dir = sys.argv[1:], _cfg_home() / f"{HOST}.json", _data_home() / "state" / HOST
+    op, stdin_buf = (argv[1].lower().replace("_", "-") if len(argv) >= 2 and argv[0] == "hook" else ""), None
+    if op in {"stop", "session-end", "sessionend"}:
+        roots = _stop_roots(cfg_path)
+        if not roots or not _in_roots(stdin_buf := sys.stdin.buffer.read(1048577), roots):
+            sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
+    if (py := _active_python(cfg_path)) is not None:
         return subprocess.run([str(py), "-I", "-X", "utf8", "-m", CLI_MOD, "--host", HOST, "--plugin-root", str(PLUGIN_ROOT), "--config", str(cfg_path), *argv], input=stdin_buf, creationflags=_NO_WIN).returncode
-    if argv[:2] == ["hook", "session-start"] or "--offline" in os.environ.get("_MINDIE_UV_FLAGS", ""):
+    if op in {"pre-invocation", "user-prompt-submit"}:
+        sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
+    if op == "session-start" or "--offline" in os.environ.get("_MINDIE_UV_FLAGS", ""):
         try:
             _enqueue_pending_check(state_dir)
         except OSError:
             pass
-        sys.stdout.buffer.write(b"{{}}\\n"); sys.stdout.buffer.flush(); return 0
+        sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
     pyz, lock = PLUGIN_ROOT / "assets" / "mindie-harness-seed.pyz", PLUGIN_ROOT / "assets" / "seed-lock.json"
     _verify_seed(pyz, lock)
     return subprocess.run([sys.executable, "-I", "-X", "utf8", str(pyz), "--host", HOST, "--plugin-root", str(PLUGIN_ROOT), "--config", str(cfg_path), "--cli-module", CLI_MOD, *argv], input=stdin_buf, creationflags=_NO_WIN).returncode
@@ -191,6 +207,11 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
+    template = (
+        raw_template.replace("__HOST_LABEL__", clean_host)
+        .replace("__HOST__", repr(clean_host))
+        .replace("__CLI_MOD__", repr(cli_module))
+    )
     assert len(template.splitlines()) < 115, f"Template exceeded 115 lines: {len(template.splitlines())}"
     return template
 
@@ -522,6 +543,63 @@ def _provision_cold(host: str, plugin_root: Path, cfg_path: Path, *, smoke_modul
             raise
 
 
+def _seed_stop_roots(cfg_path: Path) -> list[str]:
+    cfg = _read_seed_json(cfg_path) or {}
+    cp = (
+        Path(c)
+        if isinstance(c := cfg.get("community_config"), str) and os.path.isabs(c)
+        else cfg_path.parent / "mindie-community.json"
+    )
+    comm = _read_seed_json(cp)
+    sp_raw = (comm or {}).get("consent_config") or cfg.get("consent_config")
+    sp = (
+        Path(sp_raw)
+        if isinstance(sp_raw, str) and os.path.isabs(sp_raw)
+        else cfg_path.parent / "mindie-consent.json"
+    )
+    cons = _read_seed_json(sp)
+    if comm is not None:
+        if comm.get("enabled") is not True:
+            return []
+        if (sp.exists() or isinstance(comm.get("consent_config"), str)) and (
+            not cons
+            or cons.get("enabled") is False
+            or cons.get("choice", "contribute" if cons.get("enabled") is True else None) != "contribute"
+        ):
+            return []
+        roots = comm.get("project_roots")
+    elif not cp.exists() and cons and cons.get("enabled") is not False and (
+        cons.get("enabled") is True or cons.get("choice") == "contribute"
+    ):
+        roots = cons.get("project_roots")
+    else:
+        return []
+    if not isinstance(roots, list) or not roots or not all(isinstance(r, str) and os.path.isabs(r) for r in roots):
+        return []
+    return [os.path.normcase(str(Path(r).resolve())) for r in roots]
+
+
+def _seed_in_roots(raw: bytes, roots: list[str]) -> bool:
+    if len(raw) > 1048576 or not raw.strip():
+        return False
+    try:
+        ev = json.loads(raw.decode("utf-8-sig"))
+    except ValueError:
+        return False
+    if not isinstance(ev, dict):
+        return False
+    wps = ev.get("workspacePaths")
+    cands = [ev.get(k) for k in ("cwd", "workspace", "workspace_root", "project_root", "directory")] + (
+        wps if isinstance(wps, list) else []
+    )
+    for ws in cands:
+        if isinstance(ws, str) and os.path.isabs(ws):
+            c = os.path.normcase(str(Path(ws).resolve()))
+            if any(os.path.commonpath([c, r]) == r for r in roots if os.path.splitdrive(c)[0] == os.path.splitdrive(r)[0]):
+                return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mindie-harness-seed", add_help=False)
     parser.add_argument("--version", action="store_true")
@@ -547,13 +625,28 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("Usage: mindie-harness-seed.pyz --host <host> --plugin-root <dir> --config <path> <args...>\n")
         return 2
 
+    cfg_path = Path(known.config).resolve()
+    hook_op = rest[1].lower().replace("_", "-") if len(rest) >= 2 and rest[0] == "hook" else ""
+    stdin_buf: bytes | None = None
+    if hook_op in {"pre-invocation", "user-prompt-submit"} and not _config_has_usable_python(_read_seed_json(cfg_path)):
+        sys.stdout.buffer.write(b"{}\n")
+        sys.stdout.buffer.flush()
+        return 0
+    if hook_op in {"stop", "session-end", "sessionend"}:
+        roots = _seed_stop_roots(cfg_path)
+        if not roots or not _seed_in_roots(stdin_buf := sys.stdin.buffer.read(1048577), roots):
+            sys.stdout.buffer.write(b"{}\n")
+            sys.stdout.buffer.flush()
+            return 0
+
     top_pkg = str(known.cli_module).split(".", 1)[0]
-    py = _provision_cold(known.host, Path(known.plugin_root).resolve(), Path(known.config).resolve(), smoke_module=top_pkg)
+    py = _provision_cold(known.host, Path(known.plugin_root).resolve(), cfg_path, smoke_module=top_pkg)
     if not rest:
         sys.stdout.write(json.dumps({"status": "provisioned", "python": str(py)}, sort_keys=True) + "\n")
         return 0
     proc = subprocess.run(
         [str(py), "-I", "-X", "utf8", "-m", known.cli_module, "--host", known.host, "--plugin-root", known.plugin_root, "--config", known.config, *rest],
+        input=stdin_buf,
         creationflags=_CREATE_NO_WINDOW,
     )
     return proc.returncode

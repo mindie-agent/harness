@@ -119,6 +119,7 @@ class MCPStdioServer:
         maintenance_callback: Callable[[], None] | None = None,
         read_workers: int = 16,
         mutation_workers: int = 8,
+        max_mutation_workers: int | None = None,
     ) -> None:
         self.router = router
         self.server_name = server_name or f"mindie-{router.surface}"
@@ -128,7 +129,8 @@ class MCPStdioServer:
         self._inflight_lock = threading.Lock()
         self._inflight: dict[str | int, threading.Event] = {}
         self._read_workers = max(4, int(read_workers))
-        self._mutation_workers = max(2, int(mutation_workers))
+        eff_mut = mutation_workers if max_mutation_workers is None else max_mutation_workers
+        self._mutation_workers = max(2, int(eff_mut))
         self._maint_busy = threading.Lock()
 
     def _acquire_own_lease(self, stack: ExitStack) -> None:

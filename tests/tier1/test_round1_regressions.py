@@ -114,6 +114,130 @@ def test_launcher_session_start_hook_succeeds_before_and_after_runtime_exists(tm
     assert pending.is_file()
 
 
+def test_launcher_and_seed_stop_consent_gate_and_cold_prompt_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mindie_harness.bootstrap import seed_main
+
+    plugin_root = tmp_path / "plugin"
+    scripts_dir = plugin_root / "scripts"
+    scripts_dir.mkdir(parents=True)
+    launcher = scripts_dir / "mindie_launch.py"
+    launcher.write_text(render_plugin_bootstrap_template("kimi"), encoding="utf-8")
+
+    cfg_dir = Path(os.environ["MINDIE_CONFIG_HOME"])
+    state_dir = Path(os.environ["MINDIE_DATA_HOME"]) / "state" / "kimi"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    # Plant a stale `admission.sqlite3`: disabled / out-of-scope Stop MUST STILL exit `{}` without cold provisioning!
+    (state_dir / "admission.sqlite3").write_bytes(b"stale-db")
+
+    allowed_proj = tmp_path / "allowed-proj"
+    allowed_proj.mkdir()
+    outside_proj = tmp_path / "outside-proj"
+    outside_proj.mkdir()
+
+    # 1. Cold `pre-invocation` and `user-prompt-submit` immediately return `{}` without scanning stdin or provisioning `.pyz`.
+    for hook_op in ("pre-invocation", "user-prompt-submit"):
+        res_prompt = subprocess.run(
+            [sys.executable, str(launcher), "hook", hook_op],
+            input=json.dumps({"prompt": "/mindie-agent optimize kernel"}),
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=True,
+        )
+        assert json.loads(res_prompt.stdout) == {}
+
+    # 2. Stale `admission.sqlite3` with sharing unconfigured or `enabled=False` exits `{}` without cold provisioning.
+    atomic_write_json(
+        cfg_dir / "mindie-community.json",
+        {"schema": "mindie-community-config/1", "enabled": False, "project_roots": [str(allowed_proj)]},
+    )
+    atomic_write_json(cfg_dir / "mindie-consent.json", {"schema": "mindie-consent/1", "choice": "disabled"})
+    for stop_op in ("stop", "session-end"):
+        res_dis = subprocess.run(
+            [sys.executable, str(launcher), "hook", stop_op],
+            input=json.dumps({"cwd": str(allowed_proj)}),
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=True,
+        )
+        assert json.loads(res_dis.stdout) == {}
+
+    # 3. Sharing enabled (`enabled=True` + `choice='contribute'`), out-of-scope `cwd` exits `{}` without cold provisioning.
+    atomic_write_json(
+        cfg_dir / "mindie-consent.json",
+        {"schema": "mindie-consent/1", "choice": "contribute"},
+    )
+    atomic_write_json(
+        cfg_dir / "mindie-community.json",
+        {
+            "schema": "mindie-community-config/1",
+            "enabled": True,
+            "project_roots": [str(allowed_proj)],
+            "consent_config": str((cfg_dir / "mindie-consent.json").resolve()),
+        },
+    )
+    res_out = subprocess.run(
+        [sys.executable, str(launcher), "hook", "stop"],
+        input=json.dumps({"cwd": str(outside_proj)}),
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+        check=True,
+    )
+    assert json.loads(res_out.stdout) == {}
+
+    # Direct `seed_main.main` also short-circuits out-of-scope `stop` before `_provision_cold`!
+    monkeypatch.setattr(seed_main, "_provision_cold", lambda *a, **kw: pytest.fail("_provision_cold must not run"))
+    monkeypatch.setattr(sys, "stdin", type("FakeIn", (), {"buffer": io.BytesIO(json.dumps({"cwd": str(outside_proj)}).encode("utf-8"))})())
+    assert seed_main.main(["--host", "kimi", "--plugin-root", str(plugin_root), "--config", str(cfg_dir / "kimi.json"), "hook", "stop"]) == 0
+
+    # 4. Fresh opted-in project WITHOUT `admission.sqlite3` and in-scope `cwd`/`workspacePaths` is NOT short-circuited!
+    (state_dir / "admission.sqlite3").unlink()
+    forwarded_file = tmp_path / "forwarded_stop.json"
+    fake_cli_pkg = tmp_path / "fake_pkg"
+    fake_cli_pkg.mkdir()
+    (fake_cli_pkg / "echo_cli.py").write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "raw = sys.stdin.buffer.read().decode('utf-8')\n"
+        f"Path({str(forwarded_file)!r}).write_text(json.dumps({{'argv': sys.argv[1:], 'stdin': json.loads(raw)}}), encoding='utf-8')\n"
+        "sys.stdout.write('{}\\n')\n",
+        encoding="utf-8",
+    )
+    shim_py = tmp_path / ("shim.cmd" if os.name == "nt" else "shim_py")
+    if os.name != "nt":
+        shim_py.write_text(
+            f"#!/bin/sh\nPYTHONPATH={str(fake_cli_pkg)!r} exec \"{sys.executable}\" \"$@\" 2>&1\n",
+            encoding="utf-8",
+        )
+        shim_py.chmod(0o755)
+        launcher_custom = scripts_dir / "mindie_launch_custom.py"
+        launcher_custom.write_text(render_plugin_bootstrap_template("kimi", cli_module="echo_cli"), encoding="utf-8")
+        atomic_write_json(cfg_dir / "kimi.json", {"host": "kimi", "python": str(shim_py)})
+        sub_ws = allowed_proj / "nested"
+        sub_ws.mkdir()
+        # Notice `-I` ignores PYTHONPATH env var, so verify via a sitecustomize-free wrapper script that strips `-I`:
+        shim_py.write_text(
+            "#!/bin/sh\n"
+            "shift; shift; shift\n"  # drop `-I -X utf8`
+            f"PYTHONPATH={str(fake_cli_pkg)!r} exec \"{sys.executable}\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        res_in = subprocess.run(
+            [sys.executable, str(launcher_custom), "hook", "session-end"],
+            input=json.dumps({"workspacePaths": [str(sub_ws)], "session_id": "s-fresh"}),
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=True,
+        )
+        assert json.loads(res_in.stdout) == {}
+        forwarded = json.loads(forwarded_file.read_text(encoding="utf-8"))
+        assert forwarded["stdin"]["session_id"] == "s-fresh"
+        assert forwarded["argv"][-2:] == ["hook", "session-end"]
+
+
 def test_cold_seed_provisions_requirements_plugin_with_wheelhouse_and_rejects_broken_plugin(tmp_path: Path) -> None:
     # 1. Broken plugin without manifests fails cleanly and does NOT publish runtime.json
     empty_plugin = tmp_path / "empty-plugin"

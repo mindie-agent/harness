@@ -206,7 +206,27 @@ def _extract_meta_bind_id(request: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _format_mcp_error(exc: BaseException) -> dict[str, Any]:
+def _normalize_tool_def(tool: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a tool definition once, stripping `CORRELATION_STRIP_KEYS` from `properties` and `required`."""
+    cleaned = dict(tool)
+    schema = cleaned.get("inputSchema")
+    if isinstance(schema, Mapping):
+        norm_schema = dict(schema)
+        props = schema.get("properties")
+        if isinstance(props, Mapping):
+            norm_schema["properties"] = {
+                k: v for k, v in props.items() if k not in CORRELATION_STRIP_KEYS
+            }
+        req = schema.get("required")
+        if isinstance(req, (list, tuple)):
+            norm_schema["required"] = [
+                r for r in req if r not in CORRELATION_STRIP_KEYS
+            ]
+        cleaned["inputSchema"] = norm_schema
+    return cleaned
+
+
+def _format_mcp_error(exc: BaseException, *, handler_started: bool = False) -> dict[str, Any]:
     if isinstance(exc, HarnessError):
         info = exc.to_dict()
         return {
@@ -215,18 +235,34 @@ def _format_mcp_error(exc: BaseException) -> dict[str, Any]:
             "structuredContent": info,
         }
     if isinstance(exc, TimeoutError):
+        if handler_started:
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "MindIE request deadline exceeded; external outcome may be unconfirmed. Inspect state before retrying.",
+                    }
+                ],
+                "isError": True,
+                "structuredContent": {
+                    "stage": "timeout",
+                    "reason": "helper_timeout",
+                    "submission_state": "uncertain",
+                    "retryable": False,
+                },
+            }
         return {
             "content": [
                 {
                     "type": "text",
-                    "text": "MindIE request deadline exceeded; external outcome may be unconfirmed. Inspect state before retrying.",
+                    "text": "MindIE request timed out before tool dispatch; operation was not sent.",
                 }
             ],
             "isError": True,
             "structuredContent": {
                 "stage": "timeout",
                 "reason": "helper_timeout",
-                "submission_state": "uncertain",
+                "submission_state": "not_sent",
                 "retryable": False,
             },
         }
@@ -262,8 +298,11 @@ class MCPRouter:
         self.surface = surface
         self.connection_id = uuid.uuid4().hex
         self._base_env = dict(os.environ if base_env is None else base_env)
-        self._tools = list(tools or self._default_tools())
-        self._tool_map = {str(t["name"]): dict(t) for t in self._tools if isinstance(t, dict) and "name" in t}
+        raw_tools = self._default_tools() if tools is None else list(tools)
+        self._tools = [
+            _normalize_tool_def(t) for t in raw_tools if isinstance(t, Mapping) and "name" in t
+        ]
+        self._tool_map = {str(t["name"]): t for t in self._tools}
         self._handler = handler
         self._session_extractor = session_extractor
         self.receipts = RemoteReceipts(profile.receipts_db)
@@ -283,18 +322,8 @@ class MCPRouter:
         return [status_tool]
 
     def list_tools(self) -> list[dict[str, Any]]:
-        """Return all registered tools for `self.surface` with correlation keys stripped from `required`."""
-        visible: list[dict[str, Any]] = []
-        for tool in self._tools:
-            cleaned = dict(tool)
-            schema = cleaned.get("inputSchema")
-            if isinstance(schema, Mapping) and isinstance(schema.get("required"), (list, tuple)):
-                cleaned["inputSchema"] = {
-                    **schema,
-                    "required": [r for r in schema["required"] if r not in CORRELATION_STRIP_KEYS],
-                }
-            visible.append(cleaned)
-        return visible
+        """Return normalized registered tools for `self.surface`."""
+        return [dict(tool) for tool in self._tools]
 
     def is_fast_lane_call(self, request: Mapping[str, Any]) -> bool:
         params = request.get("params")
@@ -303,7 +332,7 @@ class MCPRouter:
         name = str(params.get("name") or "")
         return is_readonly_or_control_tool(name, self._tool_map.get(name))
 
-    def _validate_and_clean_args(self, name: str, raw_args: Any) -> tuple[dict[str, Any], str | None]:
+    def _validate_and_clean_args(self, name: str, raw_args: Any) -> dict[str, Any]:
         if raw_args is None:
             raw_args = {}
         if not isinstance(raw_args, Mapping):
@@ -322,8 +351,6 @@ class MCPRouter:
                 reportable=False,
             )
         args = dict(raw_args)
-        raw_bind = args.get("_mindie_bind_id")
-        bind_id = raw_bind.strip() if isinstance(raw_bind, str) and raw_bind.strip() else None
         for key in CORRELATION_STRIP_KEYS:
             args.pop(key, None)
 
@@ -338,7 +365,7 @@ class MCPRouter:
         schema = tool_def.get("inputSchema")
         if isinstance(schema, Mapping):
             props = schema.get("properties")
-            req = [r for r in (schema.get("required") or ()) if r not in CORRELATION_STRIP_KEYS]
+            req = list(schema.get("required") or ())
             missing = [r for r in req if r not in args]
             if missing:
                 raise HarnessError(
@@ -368,7 +395,7 @@ class MCPRouter:
                     reason="invalid_rsi_arguments",
                     reportable=False,
                 ) from exc
-        return args, bind_id
+        return args
 
     def call_tool(
         self,
@@ -388,12 +415,13 @@ class MCPRouter:
         name = str(params.get("name") or "")
         claimed_call_id: str | None = None
         claimed_bind_id: str | None = None
+        handler_started = False
         primary_succeeded = False
         outcome_label = "unknown"
         result: dict[str, Any] | None = None
 
         try:
-            args, explicit_bind_id = self._validate_and_clean_args(name, params.get("arguments"))
+            args = self._validate_and_clean_args(name, params.get("arguments"))
             deadline = compute_tool_deadline(self.surface, name, args, explicit_timeout=timeout)
             args_digest = hashlib.sha256(json.dumps(args, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -402,21 +430,23 @@ class MCPRouter:
                 if self._session_extractor is not None
                 else None
             ) or _extract_meta_session(request, self._base_env)
-            effective_bind_id = explicit_bind_id or _extract_meta_bind_id(request)
+            effective_bind_id = _extract_meta_bind_id(request)
 
             bound_cwd: Path | None = None
-            try:
-                bind_row = self.binds.claim_bind(
-                    bind_id=effective_bind_id,
-                    session=extracted_session,
-                    tool=name,
-                    args_digest=args_digest,
-                    deadline=deadline.expires_at,
-                )
-            except TimeoutError:
-                raise
-            except (sqlite3.Error, OSError):
-                bind_row = None
+            bind_row: dict[str, Any] | None = None
+            if effective_bind_id is not None or extracted_session is not None:
+                try:
+                    bind_row = self.binds.claim_bind(
+                        bind_id=effective_bind_id,
+                        session=extracted_session,
+                        tool=name,
+                        args_digest=args_digest,
+                        deadline=deadline.expires_at,
+                    )
+                except TimeoutError:
+                    raise
+                except (sqlite3.Error, OSError):
+                    bind_row = None
 
             if bind_row is not None:
                 claimed_bind_id = bind_row["bind_id"]
@@ -484,6 +514,7 @@ class MCPRouter:
                     "isError": False,
                 }
             elif self._handler is not None:
+                handler_started = True
                 result = self._handler(ctx, args)
             else:
                 raise HarnessError(
@@ -512,12 +543,12 @@ class MCPRouter:
             return result
 
         except ProcessCancelledError as exc:
-            outcome_label = "unknown"
-            result = _format_mcp_error(exc)
+            outcome_label = "unknown" if handler_started else "failed"
+            result = _format_mcp_error(exc, handler_started=handler_started)
             return result
         except Exception as exc:
-            outcome_label = "unknown" if isinstance(exc, TimeoutError) else "failed"
-            result = _format_mcp_error(exc)
+            outcome_label = "unknown" if (isinstance(exc, TimeoutError) and handler_started) else "failed"
+            result = _format_mcp_error(exc, handler_started=handler_started)
             return result
         finally:
             accounting_exc: BaseException | None = None
