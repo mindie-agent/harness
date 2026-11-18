@@ -40,7 +40,7 @@ import time
 from typing import Any
 
 SEED_LOCK_SCHEMA = "mindie-harness-seed/1"
-SEED_VERSION = "0.1.1"
+SEED_VERSION = "0.1.2"
 MIN_FREE_BYTES = int(2.5 * (1024 ** 3))
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _WIN_EXTS = (".exe", ".cmd", ".bat", ".com", ".ps1")

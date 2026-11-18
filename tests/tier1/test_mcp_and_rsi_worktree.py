@@ -1,4 +1,4 @@
-"""Tier 1 concurrent MCP server, `P2.7`/`P2.1`, process tree kill, RSI worktree & wheel smoke tests (`< 15s`)."""
+"""Tier 1 concurrent MCP server, silent default-on (`P2.7`/`P2.8`), process tree kill, RSI worktree & wheel smoke tests (`< 15s`)."""
 from __future__ import annotations
 
 import json
@@ -12,8 +12,7 @@ import time
 from typing import Any
 import pytest
 
-from mindie_harness import Deadline, ProcessSpec, ProfileRef, __version__, open_wal_database, run_owned
-from mindie_harness.atomic import atomic_write_json
+from mindie_harness import Deadline, ProcessSpec, ProfileRef, __version__, run_owned
 from mindie_harness.mcp.router import MCPRouter, RequestContext
 from mindie_harness.mcp.server import MCPStdioServer, read_mcp_message, write_mcp_message
 from mindie_harness.rsi import complete, experiment_ledger, finish, init, next_step
@@ -44,11 +43,21 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
         },
         {
             "name": "knowledge_query",
-            "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "mode": {"type": "string"}},
+                "required": ["query", "request_nonce", "_mindie_bind_id", "context_file"],
+                "additionalProperties": False,
+            },
         },
         {
             "name": "knowledge_distill",
-            "inputSchema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary", "request_nonce"],
+                "additionalProperties": False,
+            },
         },
     ]
 
@@ -70,7 +79,7 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
 
     c2s_r, c2s_w = os.pipe()
     s2c_r, s2c_w = os.pipe()
-    router = MCPRouter(profile, surface="remote", tools=tools, handler=_handler)
+    router = MCPRouter(profile, surface="all", tools=tools, handler=_handler)
     server = MCPStdioServer(router)
 
     srv_in = os.fdopen(c2s_r, "rb")
@@ -107,21 +116,24 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
             return msg, fmt
 
     try:
-        # 1. Content-Length framing initialize + tools/list (knowledge_* hidden, request_nonce stripped!)
+        # 1. Content-Length framing initialize + tools/list (all tools visible on cold start, correlation keys stripped!)
         write_mcp_message(cli_out, {"jsonrpc": "2.0", "id": "init-1", "method": "initialize", "params": {}}, "content-length")
         init_resp, init_fmt = _wait_id("init-1")
         assert init_fmt == "content-length"
-        assert init_resp["result"]["serverInfo"]["name"] == "mindie-remote"
+        assert init_resp["result"]["serverInfo"]["name"] == "mindie-all"
 
         write_mcp_message(cli_out, {"jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {}}, "jsonl")
         list_resp, list_fmt = _wait_id("list-1")
         assert list_fmt == "jsonl"
         listed_names = [t["name"] for t in list_resp["result"]["tools"]]
-        assert "knowledge_query" not in listed_names
+        assert "knowledge_query" in listed_names
+        assert "knowledge_distill" in listed_names
         read_schema = next(t["inputSchema"] for t in list_resp["result"]["tools"] if t["name"] == "remote_read")
         assert "request_nonce" not in read_schema["required"]
+        kq_schema = next(t["inputSchema"] for t in list_resp["result"]["tools"] if t["name"] == "knowledge_query")
+        assert kq_schema["required"] == ["query"]
 
-        # 2. Fire a slow foreground `remote_bash` AND while it blocks, fire 6 parallel `remote_read` + `remote_job_status`!
+        # 2. Fire a slow foreground `remote_bash` AND while it blocks, fire 6 parallel `remote_read`, `remote_job_status` & `knowledge_query`!
         write_mcp_message(
             cli_out,
             {"jsonrpc": "2.0", "id": "bash-slow", "method": "tools/call", "params": {"name": "remote_bash", "arguments": {"cmd": "sleep 10"}}},
@@ -140,14 +152,22 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
             {"jsonrpc": "2.0", "id": "status-1", "method": "tools/call", "params": {"name": "remote_job_status", "arguments": {"job_id": "j1"}}},
             "jsonl",
         )
+        write_mcp_message(
+            cli_out,
+            {"jsonrpc": "2.0", "id": "kq-fastlane", "method": "tools/call", "params": {"name": "knowledge_query", "arguments": {"query": "tiling", "mode": "explore"}}},
+            "jsonl",
+        )
 
-        # All 6 parallel reads (>4 old cap!) + status MUST complete while `bash-slow` is STILL running!
+        # All 6 parallel reads (>4 old cap!) + status + read-only knowledge_query MUST complete while `bash-slow` is STILL running!
         for i in range(6):
             r_msg, r_fmt = _wait_id(f"read-{i}", timeout=2.0)
             assert r_fmt == ("content-length" if i % 2 == 0 else "jsonl")
             assert r_msg["result"]["isError"] is False
         st_msg, _ = _wait_id("status-1", timeout=2.0)
         assert st_msg["result"]["isError"] is False
+        kqf_msg, _ = _wait_id("kq-fastlane", timeout=2.0)
+        assert kqf_msg["result"]["isError"] is False
+        assert f"knowledge_query:ok:oc-conn-{router.connection_id[:12]}" in kqf_msg["result"]["content"][0]["text"]
         assert "bash-slow" not in responses  # Proof they didn't wait for bash-slow!
 
         # 3. Cancel `bash-slow` via `notifications/cancelled`
@@ -155,50 +175,39 @@ def test_concurrent_mcp_stdio_dual_framing_zero_binding_and_cancellation(tmp_pat
         bash_msg, _ = _wait_id("bash-slow", timeout=2.0)
         assert bash_msg["result"]["isError"] is True
 
-        # 4. P2.1 strict gate on `knowledge_*` vs activation + consent
+        # 4. Silent default-on (`P2.7` / `P2.8`) cold-start `knowledge_*` with zero `_meta` & zero `admission.sqlite3`
         write_mcp_message(
             cli_out,
-            {"jsonrpc": "2.0", "id": "k-blocked", "method": "tools/call", "params": {"name": "knowledge_query", "arguments": {"query": "tiling"}, "_meta": {"session_id": "s-1"}}},
+            {
+                "jsonrpc": "2.0",
+                "id": "kd-cold",
+                "method": "tools/call",
+                "params": {
+                    "name": "knowledge_distill",
+                    "arguments": {"summary": "x", "request_nonce": "legacy-nonce", "_mindie_bind_id": "legacy-bind"},
+                },
+            },
             "jsonl",
         )
-        kb_msg, _ = _wait_id("k-blocked")
-        assert kb_msg["result"]["isError"] is True
-        assert kb_msg["result"]["structuredContent"]["reason"] == "knowledge_lease_inactive"
-        assert not profile.admission_db.exists()  # Read-only check never created empty DB!
+        kd_msg, _ = _wait_id("kd-cold")
+        assert kd_msg["result"]["isError"] is False
+        assert f"knowledge_distill:ok:oc-conn-{router.connection_id[:12]}" in kd_msg["result"]["content"][0]["text"]
+        assert not profile.admission_db.exists()  # Cold start never requires or creates `admission.sqlite3`!
 
-        # Grant manual /mindie-agent lease -> `knowledge_query` succeeds, `knowledge_distill` still requires consent!
-        conn = open_wal_database(profile.admission_db, create=True)
-        assert conn is not None
-        with conn:
-            conn.execute("CREATE TABLE leases(session TEXT PRIMARY KEY, enabled INTEGER, entry_enabled INTEGER)")
-            conn.execute("INSERT INTO leases VALUES('s-1', 1, 1)")
-        conn.close()
-
+        # Forged identity arguments in `arguments` remain strictly rejected!
         write_mcp_message(
             cli_out,
-            {"jsonrpc": "2.0", "id": "k-ok", "method": "tools/call", "params": {"name": "knowledge_query", "arguments": {"query": "tiling", "mode": "explore"}, "_meta": {"session_id": "s-1"}}},
+            {
+                "jsonrpc": "2.0",
+                "id": "k-forged",
+                "method": "tools/call",
+                "params": {"name": "knowledge_query", "arguments": {"query": "tiling", "session_id": "spoofed"}},
+            },
             "jsonl",
         )
-        kok_msg, _ = _wait_id("k-ok")
-        assert kok_msg["result"]["isError"] is False
-
-        write_mcp_message(
-            cli_out,
-            {"jsonrpc": "2.0", "id": "kd-noconsent", "method": "tools/call", "params": {"name": "knowledge_distill", "arguments": {"summary": "x"}, "_meta": {"session_id": "s-1"}}},
-            "jsonl",
-        )
-        kdn_msg, _ = _wait_id("kd-noconsent")
-        assert kdn_msg["result"]["isError"] is True
-        assert kdn_msg["result"]["structuredContent"]["reason"] == "consent_required"
-
-        atomic_write_json(profile.consent_path, {"choice": "contribute"})
-        write_mcp_message(
-            cli_out,
-            {"jsonrpc": "2.0", "id": "kd-ok", "method": "tools/call", "params": {"name": "knowledge_distill", "arguments": {"summary": "x"}, "_meta": {"session_id": "s-1"}}},
-            "jsonl",
-        )
-        kdok_msg, _ = _wait_id("kd-ok")
-        assert kdok_msg["result"]["isError"] is False
+        kf_msg, _ = _wait_id("k-forged")
+        assert kf_msg["result"]["isError"] is True
+        assert kf_msg["result"]["structuredContent"]["reason"] == "forged_identity_argument"
 
         assert dict(os.environ) == env_snapshot
         assert os.getcwd() == cwd_snapshot

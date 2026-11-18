@@ -22,9 +22,9 @@ This repository owns the shared pure-stdlib plugin substrate (`mindie_harness`, 
    - Classify lock contention (`LockTimeoutError`) as `deferred` (`reportable=False`) and clean non-zero builder exits as retryable `failed_cleanly`—zero permanent local `unknown` self-bricking.
    - Whenever `mindie_harness/bootstrap/seed_main.py` changes, rebuild `dist/mindie-harness-seed.pyz` and `dist/seed-lock.json` via `python3 scripts/build_seed.py` and verify `python3 scripts/build_seed.py --check`.
 
-4. **State Safety, WSL2 DrvFS Guard, `P2.7`/`P2.1` MCP & Linked Worktrees (`HAR-STATE`)**:
+4. **State Safety, WSL2 DrvFS Guard, Silent Default-On `P2.7`/`P2.8` MCP & Linked Worktrees (`HAR-STATE`)**:
    - Configure SQLite `WAL` + `busy_timeout=5000` once in `open_wal_database` (`open_database`); read-only checks (`create=False`) NEVER create empty SQLite files, and WSL2 `drvfs`/`9p` (`aname=drvfs`) paths fail fast with `drvfs_unsafe_state_root`.
-   - Deterministic MCP tools require **zero** pre-call session binding (`P2.7`) and run read-only/status/cancel calls without blocking behind foreground mutations; `knowledge_*` strictly enforces `P2.1` manual `/mindie-agent` session admission + sharing consent.
+   - All MCP surfaces (`remote`, `tools`, `components`, `knowledge`, `all`) enforce **100% silent default-on & zero pre-call session binding (`P2.7` / `P2.8`)**, stripping legacy correlation keys (`request_nonce`, `_mindie_bind_id`, `context_file`), falling back to `{host}-conn-{connection_id[:12]}` when host session metadata is absent, and running read-only/status/cancel calls (including `knowledge_query` and `knowledge_explain`) without blocking behind foreground mutations while rejecting forged identity arguments.
    - Preserve Receipt Honesty (`isError=False` + `receipt_warning` + `receipt_unconfirmed=True`) when local receipt writes fail after a primary operation succeeds.
    - Keep `mindie_harness.rsi` linked-worktree safe (`.git` directory and `.git` file `gitdir:` checkouts).
 

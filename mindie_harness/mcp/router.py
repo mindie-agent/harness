@@ -1,31 +1,29 @@
-"""`P2.7` zero-binding deterministic MCP router vs `P2.1` strict `knowledge_*` admission.
+"""Silent default-on & `P2.7`/`P2.8` zero-binding MCP router across all MindIE surfaces.
 
 [Role]
-Validates MCP `tools/call` envelopes, enforces forged-identity argument rejection,
-routes deterministic tools (`remote_*`, `coordinator`, `debugger`, `diagnostics`,
-`npu-top`, `profiler`, `sim`) with ZERO pre-call session-binding gates (`P2.7`),
-enforces strict session + manual `/mindie-agent` + consent admission on `knowledge_*`
-(`P2.1`), and preserves Receipt Honesty when local accounting fails after success.
+Validates MCP `tools/call` envelopes, rejects forged-identity arguments, exposes
+all registered tools across `remote`, `tools`, `components`, `knowledge`, and `all`
+with ZERO pre-call session-binding or manual admission gates (`P2.7` / `P2.8`),
+and preserves Receipt Honesty when local accounting fails after primary success.
 
 [Invariants]
 - Never mutates global `os.environ` or `os.chdir()`; every call builds an isolated
   `RequestContext` (`session_id`, `cwd`, `env`, `deadline`, `cancel`).
-- Read-only / status / cancel deterministic tools (`is_readonly_or_control_tool`)
-  have ZERO artificial concurrency cap (`AD-09` fixed) and zero replay-ledger lock contention.
-- Deterministic tools silently strip legacy optional `_mindie_bind_id` / `request_nonce`
-  if sent by older clients and NEVER require them (`P2.7`).
-- `knowledge_*` tools check `admission.sqlite3` via `open_wal_database(..., create=False)`
-  (never creating empty DBs on unactivated checks, Iron Rule 1) and require
-  `enabled == 1 AND entry_enabled == 1`.
+- Read-only / status / cancel tools (`is_readonly_or_control_tool`, including
+  `knowledge_query` and `knowledge_explain`) have ZERO artificial concurrency cap
+  (`AD-09` fixed) and zero replay-ledger lock contention.
+- All tools uniformly strip legacy optional `_mindie_bind_id`, `request_nonce`, and
+  `context_file` from `inputSchema["required"]` and incoming arguments, falling back
+  to `{host}-conn-{connection_id[:12]}` when host session metadata is absent.
 
 [Timeouts & Locks]
 - Enforces Principle 10 per-tool budgets (`remote_bash` `660s = 600s + 60s`,
-  `remote_write_stdin` `360s = 300s + 60s`, `components` `130s = 120s + 10s`,
+  `remote_write_stdin` `360s = 300s + 60s`, `components` `130s..660s`,
   `knowledge` `45s = 35s + 10s` / `120s = 110s + 10s`).
 
 [Side-Effect Policy]
 - Dispatches validated tool invocations through the bound `HostAdapter` or handler map
-  and records mutation receipts in `RemoteReceipts`.
+  and records idempotent mutation receipts in `RemoteReceipts`.
 """
 from __future__ import annotations
 
@@ -40,8 +38,7 @@ import threading
 from typing import Any, Callable, Mapping
 import uuid
 
-from ..atomic import read_json_safe
-from ..paths import HarnessError, ProfileRef, open_wal_database
+from ..paths import HarnessError, ProfileRef
 from ..process.supervisor import Deadline, ProcessCancelledError
 from ..rsi import rsi_explore
 from .receipts import BindStore, RemoteReceipts, apply_receipt_honesty
@@ -56,7 +53,9 @@ FORGED_IDENTITY_KEYS: frozenset[str] = frozenset(
         "project_root",
     }
 )
-CORRELATION_STRIP_KEYS: frozenset[str] = frozenset({"_mindie_bind_id", "request_nonce"})
+CORRELATION_STRIP_KEYS: frozenset[str] = frozenset(
+    {"_mindie_bind_id", "request_nonce", "context_file"}
+)
 
 REMOTE_NATIVE_MAX_WAIT_MS: dict[str, int] = {
     "remote_bash": 600_000,
@@ -90,9 +89,8 @@ READONLY_TOOL_PREFIXES: tuple[str, ...] = (
     "npu_top",
     "diagnostics_status",
     "debugger_triage",
-)
-CONSENT_REQUIRED_KNOWLEDGE_TOOLS: frozenset[str] = frozenset(
-    {"knowledge_distill", "knowledge_export", "knowledge_publish"}
+    "knowledge_query",
+    "knowledge_explain",
 )
 
 
@@ -208,58 +206,6 @@ def _extract_meta_bind_id(request: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _verify_knowledge_admission(profile: ProfileRef, session_id: str, tool_name: str, deadline: Deadline) -> None:
-    """Enforce `P2.1` manual `/mindie-agent` entry lease + sharing consent for `knowledge_*`."""
-    conn = open_wal_database(profile.admission_db, create=False, deadline=deadline.expires_at)
-    if conn is None:
-        raise HarnessError(
-            "Knowledge tools require explicit `/mindie-agent` session activation (`admission.sqlite3` absent).",
-            stage="admission",
-            reason="knowledge_lease_inactive",
-            submission_state="not_sent",
-            retryable=False,
-            reportable=False,
-        )
-    try:
-        row = conn.execute(
-            "SELECT enabled, entry_enabled FROM leases WHERE session=?",
-            (session_id,),
-        ).fetchone()
-    except sqlite3.Error as exc:
-        raise HarnessError(
-            f"Unable to verify knowledge session lease: {type(exc).__name__}",
-            stage="admission",
-            reason="admission_unavailable",
-            submission_state="not_sent",
-            retryable=False,
-            reportable=False,
-        ) from exc
-    finally:
-        conn.close()
-
-    if row is None or int(row[0]) != 1 or int(row[1]) != 1:
-        raise HarnessError(
-            f"Session {session_id!r} has not manually activated `/mindie-agent` knowledge access.",
-            stage="admission",
-            reason="knowledge_lease_inactive",
-            submission_state="not_sent",
-            retryable=False,
-            reportable=False,
-        )
-
-    if tool_name in CONSENT_REQUIRED_KNOWLEDGE_TOOLS:
-        consent_doc = read_json_safe(profile.consent_path)
-        if not isinstance(consent_doc, dict) or consent_doc.get("choice") != "contribute":
-            raise HarnessError(
-                f"{tool_name} requires explicit sharing consent (`choice='contribute'`) in mindie-consent.json.",
-                stage="admission",
-                reason="consent_required",
-                submission_state="not_sent",
-                retryable=False,
-                reportable=False,
-            )
-
-
 def _format_mcp_error(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, HarnessError):
         info = exc.to_dict()
@@ -337,18 +283,12 @@ class MCPRouter:
         return [status_tool]
 
     def list_tools(self) -> list[dict[str, Any]]:
-        """Return public tools for `self.surface` (`knowledge_*` never leaked on unactivated discovery)."""
-        if self.surface == "knowledge":
-            return []
+        """Return all registered tools for `self.surface` with correlation keys stripped from `required`."""
         visible: list[dict[str, Any]] = []
         for tool in self._tools:
-            name = str(tool.get("name", ""))
-            if name.startswith("knowledge_"):
-                continue
             cleaned = dict(tool)
             schema = cleaned.get("inputSchema")
-            if isinstance(schema, dict) and isinstance(schema.get("required"), list):
-                # Enforce P2.7: deterministic tools NEVER require `request_nonce` or `_mindie_bind_id`!
+            if isinstance(schema, Mapping) and isinstance(schema.get("required"), (list, tuple)):
                 cleaned["inputSchema"] = {
                     **schema,
                     "required": [r for r in schema["required"] if r not in CORRELATION_STRIP_KEYS],
@@ -382,10 +322,10 @@ class MCPRouter:
                 reportable=False,
             )
         args = dict(raw_args)
-        bind_id = args.get("_mindie_bind_id") if isinstance(args.get("_mindie_bind_id"), str) else None
-        if not name.startswith("knowledge_"):
-            for key in CORRELATION_STRIP_KEYS:
-                args.pop(key, None)
+        raw_bind = args.get("_mindie_bind_id")
+        bind_id = raw_bind.strip() if isinstance(raw_bind, str) and raw_bind.strip() else None
+        for key in CORRELATION_STRIP_KEYS:
+            args.pop(key, None)
 
         tool_def = self._tool_map.get(name)
         if tool_def is None:
@@ -398,7 +338,7 @@ class MCPRouter:
         schema = tool_def.get("inputSchema")
         if isinstance(schema, Mapping):
             props = schema.get("properties")
-            req = [r for r in (schema.get("required") or ()) if name.startswith("knowledge_") or r not in CORRELATION_STRIP_KEYS]
+            req = [r for r in (schema.get("required") or ()) if r not in CORRELATION_STRIP_KEYS]
             missing = [r for r in req if r not in args]
             if missing:
                 raise HarnessError(
@@ -437,7 +377,7 @@ class MCPRouter:
         cancel: threading.Event | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Validate, admit, execute, and finalize one MCP `tools/call` request."""
+        """Validate, execute, and finalize one MCP `tools/call` request across any surface."""
         cancel_ev = cancel or threading.Event()
         req_id = request.get("id", "0")
         params = request.get("params")
@@ -473,7 +413,9 @@ class MCPRouter:
                     args_digest=args_digest,
                     deadline=deadline.expires_at,
                 )
-            except (TimeoutError, sqlite3.Error, OSError):
+            except TimeoutError:
+                raise
+            except (sqlite3.Error, OSError):
                 bind_row = None
 
             if bind_row is not None:
@@ -482,23 +424,11 @@ class MCPRouter:
                 if bind_row.get("cwd"):
                     bound_cwd = Path(bind_row["cwd"])
 
-            if name.startswith("knowledge_"):
-                if not extracted_session:
-                    raise HarnessError(
-                        "Knowledge tools require verified host session identity (`P2.1`).",
-                        stage="admission",
-                        reason="session_identity_required",
-                        submission_state="not_sent",
-                        reportable=False,
-                    )
-                session_id = extracted_session
-                _verify_knowledge_admission(self.profile, session_id, name, deadline)
-            else:
-                # Iron Rule 5 (P2.7): zero pre-call session binding required on deterministic tools!
-                session_id = extracted_session or f"{self.profile.host}-conn-{self.connection_id[:12]}"
+            # Iron Rule 5 (P2.7 / P2.8): zero pre-call session binding across all surfaces!
+            session_id = extracted_session or f"{self.profile.host}-conn-{self.connection_id[:12]}"
 
             readonly = is_readonly_or_control_tool(name, self._tool_map.get(name))
-            if not readonly and not name.startswith("knowledge_"):
+            if not readonly:
                 req_hash = hashlib.sha256(json.dumps(req_id, sort_keys=True).encode("utf-8")).hexdigest()[:24]
                 call_id = f"{self.connection_id}:{req_hash}"
                 if not self.receipts.claim(

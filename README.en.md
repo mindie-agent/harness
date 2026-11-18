@@ -1,12 +1,12 @@
 # MindIE Harness (`mindie-harness`)
 
 <p>
-  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.1-blue" alt="Release v0.1.1"></a>
+  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.2-blue" alt="Release v0.1.2"></a>
 </p>
 
 简体中文: [README.md](README.md) | English
 
-`mindie-harness` (repository `mindie-agent/harness`, import package `mindie_harness`, version `0.1.1`) is the **zero-heavy-dependency, pure-Python-stdlib shared plugin substrate** powering all 7 MindIE Agent host plugins (`codex`, `cc`, `kimi`, `dsh`, `agy`, `wb`, `oc`).
+`mindie-harness` (repository `mindie-agent/harness`, import package `mindie_harness`, version `0.1.2`) is the **zero-heavy-dependency, pure-Python-stdlib shared plugin substrate** powering all 7 MindIE Agent host plugins (`codex`, `cc`, `kimi`, `dsh`, `agy`, `wb`, `oc`).
 
 ## Core Responsibilities
 
@@ -18,8 +18,8 @@
    - Enforces a `2.5 GiB` free-space floor on candidate runtime builds (never blocking small receipt writes), pins same-volume `UV_CACHE_DIR`, builds a single `.venv` at the final generation path, and commits `<host>.json` last.
    - Protects live generations via non-`FILE_SHARE_DELETE` `.inuse.<pid>.<uuid>.lease` handles + two-stage `.trash.<uuid>` atomic directory renames, retaining `Active + Rollback (<= 2)` plus cross-plugin and OS-scheduled closures.
 3. **Dual-Framing Concurrent Resident MCP Gateway & Receipt Honesty (`mindie_harness.mcp`)**
-   - Serves both `Content-Length` and JSONL stdio framing concurrently; read-only/status/cancel calls never block behind foreground mutations.
-   - Enforces `P2.7` zero-binding deterministic tool access alongside `P2.1` manual `/mindie-agent` admission for `knowledge_*`, preserving `isError=False` + `receipt_warning` + `receipt_unconfirmed=True` on post-success local receipt errors.
+   - Serves both `Content-Length` and JSONL stdio framing concurrently; read-only/status/cancel calls (including `knowledge_query` and `knowledge_explain`) never block behind foreground mutations.
+   - Enforces 100% silent default-on & `P2.7` / `P2.8` zero pre-call session binding uniformly across all MCP surfaces (`remote`, `tools`, `components`, `knowledge`, `all`), stripping optional correlation keys (`request_nonce`, `_mindie_bind_id`, `context_file`), falling back to `{host}-conn-{connection_id[:12]}` when host metadata is absent, and preserving `isError=False` + `receipt_warning` + `receipt_unconfirmed=True` on post-success local receipt errors.
 4. **Consolidated Pure-Stdlib RSI Engine (`mindie_harness.rsi`)**
    - Hosts linked-worktree-safe `experiment_ledger`, `rsi_loop` (`mindie-rsi-loop/2`), `rsi_crossover`, and `rsi_explore`.
 5. **Reproducible `< 60 KB` Cold-Bootstrap Seed (`mindie_harness.bootstrap`)**

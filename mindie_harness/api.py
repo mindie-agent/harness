@@ -67,7 +67,7 @@ from .runtime.activation import (
 from .runtime.builder import PreparedGeneration, prepare_candidate_runtime
 from .runtime.registry import SHARED_COMPONENTS, RuntimeSelection
 
-__version__: Final[str] = "0.1.1"
+__version__: Final[str] = "0.1.2"
 API_VERSION: Final[int] = 1
 
 
@@ -88,7 +88,7 @@ class HostAdapter(Protocol):
         """Extract verified native session ID from an MCP request/env, if present."""
 
     def mcp_tools(self, surface: str, profile: ProfileRef) -> list[dict[str, Any]]:
-        """Return MCP tool definitions for `surface` (`remote | tools | components | all`)."""
+        """Return MCP tool definitions for `surface` (`remote | tools | components | knowledge | all`)."""
 
     def dispatch_tool(
         self,

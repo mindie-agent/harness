@@ -1,12 +1,12 @@
 # MindIE Harness (`mindie-harness`)
 
 <p>
-  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.1-blue" alt="Release v0.1.1"></a>
+  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.2-blue" alt="Release v0.1.2"></a>
 </p>
 
 [English](README.en.md) | 简体中文
 
-`mindie-harness`（仓库 `mindie-agent/harness`，导入包 `mindie_harness`，当前版本 `0.1.1`）是 MindIE Agent 7 个原生宿主插件（`codex`、`cc`、`kimi`、`dsh`、`agy`、`wb`、`oc`）共用的**零重依赖纯 Python 标准库底座**。
+`mindie-harness`（仓库 `mindie-agent/harness`，导入包 `mindie_harness`，当前版本 `0.1.2`）是 MindIE Agent 7 个原生宿主插件（`codex`、`cc`、`kimi`、`dsh`、`agy`、`wb`、`oc`）共用的**零重依赖纯 Python 标准库底座**。
 
 ## 核心职责边界
 
@@ -18,8 +18,8 @@
    - 候选环境构建强制 `>= 2.5 GiB` 可用磁盘预检（绝不阻塞轻量回执落盘）、同卷 `UV_CACHE_DIR` 零拷贝硬链接、最终路径单 `.venv` 构建，权威指针 `<host>.json` 最后一步原子提交。
    - Windows 非 `FILE_SHARE_DELETE` `.inuse.<pid>.<uuid>.lease` 句柄 + 双阶段同卷 `.trash.<uuid>` 原子改名探测，保留 `Active + Rollback (<= 2)` 代及跨插件/计划任务闭包。
 3. **双帧长驻并发 MCP 网关与诚实回执 (`mindie_harness.mcp`)**
-   - 同时兼容 `Content-Length` 与 JSONL 帧；只读/状态查询/取消请求走独立高并发线程池，绝不被慢速前台命令阻塞。
-   - 严格贯彻 `P2.7`（确定性工具零会话绑定直通）与 `P2.1`（`knowledge_*` 显式手动会话准入），落实 Receipt Honesty（主操作成功后本地回执异常保持 `isError=False` 并附加 `receipt_warning` + `receipt_unconfirmed=True`）。
+   - 同时兼容 `Content-Length` 与 JSONL 帧；只读/状态查询/取消请求（含 `knowledge_query` 与 `knowledge_explain`）走独立高并发线程池，绝不被慢速前台命令阻塞。
+   - 统一贯彻全表面（`remote`、`tools`、`components`、`knowledge`、`all`）静默默认就绪与零前置会话绑定直通（`P2.7` / `P2.8`），自动剥离可选关联键（`request_nonce`、`_mindie_bind_id`、`context_file`）并在缺失宿主元数据时回退至连接标识 `{host}-conn-{connection_id[:12]}`；落实 Receipt Honesty（主操作成功后本地回执异常保持 `isError=False` 并附加 `receipt_warning` + `receipt_unconfirmed=True`）。
 4. **纯标准库 RSI 实验账本与循环状态机 (`mindie_harness.rsi`)**
    - 统一承载 `experiment_ledger`（原生支持 linked Git worktree `.git` 文件）、`rsi_loop`（`mindie-rsi-loop/2`）、`rsi_crossover` 与 `rsi_explore`。
 5. **`< 60 KB` 可重现冷启动 Seed (`mindie_harness.bootstrap`)**

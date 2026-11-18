@@ -59,7 +59,7 @@ GUIDE = {
         '{"bottleneck_summary": {...}, "profile_ref": "<receipt or path>"}.'
     ),
     "consult": (
-        "When /mindie-agent knowledge is enabled and an information gap remains, call "
+        "When an information gap remains, call "
         "knowledge_query(query=<bottleneck>, mode=<mode>) and read the cards you will "
         "rely on with knowledge_explain. In explore mode pass native_subcontext=True, "
         "ledger_entries and bottleneck_summary, and seed a fresh subagent only with "

@@ -79,7 +79,7 @@ def test_10_fault_injection_upgrade_and_gc_scenarios(tmp_path: Path, monkeypatch
         data_dir=tmp_path / "data",
     )
     profile.plugin_root.mkdir(parents=True)
-    # Seed user consent (`P2.1`) to verify upgrades NEVER overwrite or delete it
+    # Seed user consent to verify upgrades NEVER overwrite or delete it
     consent_payload = {"schema": "mindie-consent/1", "choice": "contribute", "choice_revision": 3}
     atomic_write_json(profile.consent_path, consent_payload)
 

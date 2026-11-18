@@ -1,0 +1,10 @@
+# mindie-harness 0.1.2: Silent Default-On & Zero Pre-Call Session Binding Across All MCP Surfaces (`P2.7` / `P2.8`)
+
+[中文](harness-0.1.2.md)
+
+`mindie-harness v0.1.2` is a patch release of the zero-heavy-dependency, pure-Python-stdlib shared substrate (`mindie_harness`) powering all 7 MindIE Agent native host plugins (`codex`, `cc`, `kimi`, `dsh`, `agy`, `wb`, `oc`), unifying silent default-on execution across every MCP surface:
+
+- **Silent Default-On & Uniform Zero-Binding Routing (`mindie_harness.mcp.router.MCPRouter`)**: Retires the legacy manual session-admission gate and `admission.sqlite3` pre-check on `knowledge_*`; all registered tools across `remote`, `tools`, `components`, `knowledge`, and `all` are exposed directly in `tools/list` on cold start and execute over standard `tools/call` with zero `_meta`, falling back uniformly to `{host}-conn-{connection_id[:12]}` while retaining optional `BindStore` (`PreToolUse`) session/cwd enrichment.
+- **Uniform Correlation-Key Stripping & Forged-Identity Guard**: Strips `CORRELATION_STRIP_KEYS` (`request_nonce`, `_mindie_bind_id`, `context_file`) uniformly from `inputSchema["required"]` and incoming arguments across all tools while preserving strict `FORGED_IDENTITY_KEYS` rejection, `rsi_explore.parse_args` validation, and `except TimeoutError: raise` precedence before `OSError` handlers (Principle 14).
+- **Read-Only Fast Lane & Idempotent Mutation Receipts**: Routes `knowledge_query` and `knowledge_explain` on the lock-free read-only fast lane while applying `RemoteReceipts` duplicate-replay protection and Receipt Honesty (`isError=False` + `receipt_warning` + `receipt_unconfirmed=True`) uniformly to non-readonly mutating tools (including `knowledge_distill`, `knowledge_sync`, `knowledge_feedback`, and remote/component mutations).
+- **Synchronized Version and Cold-Bootstrap Seed**: `pyproject.toml`, package metadata, bilingual docs, and `dist/mindie-harness-seed.pyz` / `dist/seed-lock.json` (`mindie-harness-seed/1`) are all bumped to `0.1.2`; `API_VERSION` remains `1`, keeping the public ABI fully backward compatible.

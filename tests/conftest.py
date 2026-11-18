@@ -44,6 +44,14 @@ def _isolated_mindie_host_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     }
     for key, val in env_overrides.items():
         monkeypatch.setenv(key, val)
-    for clear_key in ("MINDIE_AGENT_CONFIG", "MINDIE_SESSION_ID", "REMOTE_DEV_SESSION_ID"):
+    for clear_key in (
+        "MINDIE_AGENT_CONFIG",
+        "MINDIE_SESSION_ID",
+        "REMOTE_DEV_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "KIMI_SESSION_ID",
+        "OPENCODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+    ):
         monkeypatch.delenv(clear_key, raising=False)
     return sandbox
