@@ -20,6 +20,7 @@
 3. **双帧长驻并发 MCP 网关与诚实回执 (`mindie_harness.mcp`)**
    - 同时兼容 `Content-Length` 与 JSONL 帧；只读/状态查询/取消请求（含 `knowledge_query` 与 `knowledge_explain`）走独立高并发线程池，绝不被慢速前台命令阻塞。
    - 统一贯彻全表面（`remote`、`tools`、`components`、`knowledge`、`all`）静默默认就绪与零前置会话绑定直通（`P2.7` / `P2.8`），自动剥离可选关联键（`request_nonce`、`_mindie_bind_id`、`context_file`）并在缺失宿主元数据时回退至连接标识 `{host}-conn-{connection_id[:12]}`；落实 Receipt Honesty（主操作成功后本地回执异常保持 `isError=False` 并附加 `receipt_warning` + `receipt_unconfirmed=True`）。
+   - Knowledge 分发惰性导入 `mindie_knowledge.loop` 的正式接口，将 `knowledge_*` 映射为服务方法，按域与引用选择引擎，并传递宿主会话身份；公开读取不创建采集租约，蒸馏沿用已有范围授权，RPC 不做签名猜测或自动重放。升级后的默认域使用当前引擎配置，避免旧域映射重新选中已退役配置。
 4. **纯标准库 RSI 实验账本与循环状态机 (`mindie_harness.rsi`)**
    - 统一承载 `experiment_ledger`（原生支持 linked Git worktree `.git` 文件）、`rsi_loop`（`mindie-rsi-loop/2`）、`rsi_crossover` 与 `rsi_explore`。
 5. **`< 60 KB` 可重现冷启动 Seed (`mindie_harness.bootstrap`)**

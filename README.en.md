@@ -20,6 +20,7 @@
 3. **Dual-Framing Concurrent Resident MCP Gateway & Receipt Honesty (`mindie_harness.mcp`)**
    - Serves both `Content-Length` and JSONL stdio framing concurrently; read-only/status/cancel calls (including `knowledge_query` and `knowledge_explain`) never block behind foreground mutations.
    - Enforces 100% silent default-on & `P2.7` / `P2.8` zero pre-call session binding uniformly across all MCP surfaces (`remote`, `tools`, `components`, `knowledge`, `all`), stripping optional correlation keys (`request_nonce`, `_mindie_bind_id`, `context_file`), falling back to `{host}-conn-{connection_id[:12]}` when host metadata is absent, and preserving `isError=False` + `receipt_warning` + `receipt_unconfirmed=True` on post-success local receipt errors.
+   - Knowledge dispatch lazily imports the `mindie_knowledge.loop` APIs, maps `knowledge_*` to service methods, routes by domain and reference, and forwards host session identity. Public reads create no capture lease; distillation retains existing scoped authority. RPC calls use one concrete signature without replay. After upgrades, the default domain uses the current engine instead of a retained retired mapping.
 4. **Consolidated Pure-Stdlib RSI Engine (`mindie_harness.rsi`)**
    - Hosts linked-worktree-safe `experiment_ledger`, `rsi_loop` (`mindie-rsi-loop/2`), `rsi_crossover`, and `rsi_explore`.
 5. **Reproducible `< 60 KB` Cold-Bootstrap Seed (`mindie_harness.bootstrap`)**

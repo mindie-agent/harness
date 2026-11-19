@@ -4,14 +4,14 @@
 Defines the 5 canonical `KNOWLEDGE_TOOL_SCHEMAS` (`knowledge_query`, `knowledge_explain`,
 `knowledge_feedback`, `knowledge_distill`, `knowledge_sync`), `KNOWLEDGE_NAMES`, and
 `invoke_knowledge_tool`—dispatching in-process through `mindie_knowledge`
-(`Admission`, `select_engine_config`, `ensure_service`, `rpc`, `result_view`) or via
+loop APIs (`Admission`, domain routing, service RPC, distillation views) or via
 the profile's configured Python when the MCP server runs under a bootstrap interpreter.
 
 [Invariants]
 - Zero top-level `mindie_knowledge` import: the optional package is imported only
   inside `invoke_knowledge_tool`, so `import mindie_harness` stays pure stdlib.
 - Receipt Honesty: once primary `rpc` succeeds, a local `adm_store.finish(...)`
-  `OSError` / `sqlite3.Error` keeps `isError=False` and attaches `receipt_warning`
+  failure keeps `isError=False` and attaches `receipt_warning`
   plus `receipt_unconfirmed=True`.
 - Unknown operations and malformed arguments return structured `isError=True`
   results; they never raise across the MCP boundary.
@@ -21,19 +21,16 @@ the profile's configured Python when the MCP server runs under a bootstrap inter
   budget plus `10s` cleanup grace; no global environment or cwd is mutated.
 
 [Side-Effect Policy]
-- Read tools are side-effect free; mutation tools execute the knowledge package's
+- Public reads do not create capture leases; mutations execute the knowledge package's
   own idempotent ledgers. The child fallback reads `<host>.json` read-only.
 """
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import json
 import os
 from pathlib import Path
-import sqlite3
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from ..atomic import read_json_safe
 from ..paths import HarnessError, ProfileRef
@@ -65,115 +62,93 @@ def _normalize_result(value: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": str(value)}], "isError": False}
 
 
-def _call_variants(fn: Any, variants: Sequence[tuple[tuple[Any, ...], dict[str, Any]]]) -> Any:
-    last_error: Exception | None = None
-    for args, kwargs in variants:
-        try:
-            return fn(*args, **kwargs)
-        except TypeError as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
-    return None
-
-
-def _try_in_process(operation: str, arguments: dict[str, Any], *, profile: ProfileRef, session_id: str, cwd: Path | None) -> dict[str, Any] | None:
-    package = sys.modules.get("mindie_knowledge")
-    if package is None:
-        try:
-            spec = importlib.util.find_spec("mindie_knowledge")
-        except (ImportError, AttributeError, ValueError):
-            return None
-        if spec is None:
-            return None
-        try:
-            package = importlib.import_module("mindie_knowledge")
-        except TimeoutError:
-            raise
-        except ImportError:
-            return None
-        except Exception as exc:
-            return _error_result("knowledge_import_failed", f"mindie_knowledge import failed ({type(exc).__name__}).")
-    if not callable(getattr(package, "rpc", None)):
-        return None
-
-    admission: Any = None
-    service: Any = None
-    closeables: list[Any] = []
+def _try_in_process(
+    operation: str, arguments: dict[str, Any], *, profile: ProfileRef,
+    session_id: str, cwd: Path | None, deadline: Deadline | None = None,
+) -> dict[str, Any] | None:
     try:
-        admission_cls = getattr(package, "Admission", None)
-        if callable(admission_cls):
-            admission = _call_variants(
-                admission_cls,
-                [
-                    ((profile.admission_db,), {"session_id": session_id}),
-                    ((profile.admission_db,), {}),
-                    ((profile,), {"session_id": session_id}),
-                    ((), {}),
-                ],
-            )
-            closeables.append(admission)
-        select_config = getattr(package, "select_engine_config", None)
-        config = None
-        if callable(select_config):
-            config = _call_variants(
-                select_config,
-                [((profile.config_path,), {}), ((str(profile.config_path),), {}), ((profile,), {}), ((), {})],
-            )
-        ensure_service = getattr(package, "ensure_service", None)
-        if callable(ensure_service):
-            service = _call_variants(
-                ensure_service,
-                [((config,), {"session_id": session_id, "admission": admission}), ((config,), {"session_id": session_id}), ((config,), {}), ((), {})],
-            )
-            closeables.append(service)
-        rpc_fn = package.rpc
-        raw = _call_variants(
-            rpc_fn,
-            [
-                ((service, operation, arguments), {"session_id": session_id, "cwd": cwd}),
-                ((service, operation, arguments), {"session_id": session_id}),
-                ((operation, arguments), {"session_id": session_id, "admission": admission}),
-                ((), {"operation": operation, "arguments": arguments, "session_id": session_id}),
-                ((service, operation, arguments), {}),
-                ((operation, arguments), {}),
-            ],
-        )
+        # Knowledge exposes these in its loop modules, not its package root.
+        from mindie_knowledge.loop.activation import Admission
+        from mindie_knowledge.loop.cli import config_at, ensure_service
+        from mindie_knowledge.loop.domain_routes import select_engine_config
+        from mindie_knowledge.loop.transport import rpc
+    except ModuleNotFoundError as exc:
+        if exc.name == "mindie_knowledge":
+            return None
+        return _error_result("knowledge_import_failed", f"Knowledge import failed ({exc}).")
+    except ImportError as exc:
+        return _error_result("knowledge_import_failed", f"Knowledge import failed ({exc}).")
+
+    method = operation.removeprefix("knowledge_")
+    stage = "config"
+    submitted = False
+    admission = None
+    lease = None
+    try:
+        if not isinstance(session_id, str) or not session_id.strip():
+            return _error_result("knowledge_identity_missing", "A host session identity is required.")
+        if any(str(key).startswith("_") for key in arguments):
+            return _error_result("invalid_arguments", "Internal identity fields are not tool arguments.")
+        adapter = read_json_safe(profile.config_path)
+        default = Path(adapter.get("engine_config") or profile.config_path.with_name(profile.config_path.stem + ".engine.json"))
+        engine = config_at(default)
+        routes = dict(adapter.get("domain_configs") or {})
+        # Native upgrades retain old domain mappings while publishing this engine.
+        routes[engine["domain"]] = str(default.resolve())
+        refs = ([arguments["ref"]] if arguments.get("ref") else []) + list(arguments.get("refs") or [])
+        selected = select_engine_config(default, domain=arguments.get("domain"), ref=refs[0] if refs else None, domain_configs=routes)
+        for ref in refs[1:]:
+            if select_engine_config(default, domain=arguments.get("domain"), ref=ref, domain_configs=routes) != selected:
+                raise ValueError("references select different knowledge domains")
+        payload = dict(arguments)
+        payload.pop("domain", None)
+        if method in {"query", "explain", "feedback", "distill"}:
+            payload["_session_id"] = session_id
+        if method == "distill":
+            stage = "authorization"
+            admission = Admission(config_at(selected)["admission_path"])
+            lease = admission.active_lease(session_id)
+            if not lease or not lease.get("token") or not lease.get("entry_enabled"):
+                return _error_result("knowledge_authorization_required", "Distillation requires existing scoped capture authorization.")
+            payload["_activation"] = lease["token"]
+        elif method in {"query", "explain", "feedback"}:
+            payload["_session_verified"] = True
+        stage = "service"
+        if deadline is not None:
+            deadline.require_remaining()
+        connection = ensure_service(selected)
+        stage = "rpc"
+        timeout = 110.0 if method in {"sync", "distill"} else 35.0
+        if deadline is not None:
+            timeout = deadline.inner_remaining()
+            if timeout <= 0:
+                raise TimeoutError("Knowledge RPC budget exhausted before dispatch")
+        submitted = True
+        raw = rpc(connection, method, payload, timeout=timeout)
     except TimeoutError:
         raise
     except HarnessError:
         raise
     except Exception as exc:
-        return _error_result("knowledge_rpc_failed", f"mindie_knowledge RPC failed ({type(exc).__name__}): {exc}")
+        result = _error_result(f"knowledge_{stage}_failed", f"{type(exc).__name__}: {exc}")
+        result["structuredContent"].update(stage=stage, submission_state="sent" if submitted else "not_sent")
+        return result
 
-    view = getattr(package, "result_view", None)
-    if callable(view):
+    if method == "distill":
+        from mindie_knowledge.graded.distill import result_view
+        raw, is_error = result_view(raw)
+        result = _normalize_result(raw)
+        result["isError"] = is_error
+    else:
+        result = _normalize_result(raw if isinstance(raw, Mapping) else {"results": raw})
+    if admission is not None and lease is not None:
         try:
-            raw = _call_variants(view, [((raw,), {}), ((operation, raw), {})])
-        except Exception:
-            pass
-    result = _normalize_result(raw)
-    adm_store = getattr(admission, "store", admission)
-    finish = getattr(adm_store, "finish", None)
-    if callable(finish):
-        try:
-            _call_variants(finish, [((), {"session_id": session_id, "operation": operation, "status": "succeeded"}), ((session_id,), {}), ((operation,), {})])
-        except TimeoutError:
-            raise
-        except (OSError, sqlite3.Error) as exc:
-            if result.get("isError") is not True:
+            admission.finish(session_id, lease["token"], not result["isError"])
+        except Exception as exc:
+            # A completed operation survives even a timeout writing its receipt.
+            if result["isError"] is not True:
                 result = apply_receipt_honesty(result, exc)
-        except Exception:
-            pass
-    for item in reversed(closeables):
-        close = getattr(item, "close", None) or getattr(item, "stop", None)
-        if callable(close):
-            try:
-                close()
-            except TimeoutError:
-                raise
-            except Exception:
-                pass
+    # ensure_service returns a shared connection; it is never owned by this call.
     return result
 
 
@@ -254,7 +229,7 @@ def invoke_knowledge_tool(
     else:
         return _error_result("invalid_arguments", "Knowledge tool arguments must be a JSON object.")
     try:
-        in_process = _try_in_process(name, args, profile=profile, session_id=session_id, cwd=cwd)
+        in_process = _try_in_process(name, args, profile=profile, session_id=session_id, cwd=cwd, deadline=deadline)
     except HarnessError as exc:
         return _error_result(exc.reason, str(exc))
     if in_process is not None:
