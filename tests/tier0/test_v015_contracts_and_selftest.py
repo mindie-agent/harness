@@ -531,3 +531,43 @@ def test_knowledge_binding_disabled_capture_mode_and_automatic_upgrade(tmp_path:
     configure_sharing(profile, choice="local-only", project_roots=[ws_auth])
     s_out = run_stop_capture(profile, {"session_id": "s-fast", "cwd": str(tmp_path / "outside-ws")})
     assert s_out == {"stage": "inert", "reason": "out-of-scope"} and sqlite_opens == []
+
+    # v0.1.6: authorized Stop on an initially disabled (no-redactor) route promotes to public-transcript,
+    # mints the Admission lease before accept_stop, and honors permanent user revocation.
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    ensure_knowledge_binding(profile, plugin_root=profile.plugin_root, python_executable=sys.executable)
+    pre_eng = json.loads(Path(json.loads(profile.config_path.read_text(encoding="utf-8"))["engine_config"]).read_text(encoding="utf-8"))
+    assert pre_eng["capture_mode"] == "disabled"
+
+    fake_act = ModuleType("mindie_knowledge.loop.activation")
+    adm_state: dict[str, str] = {}
+
+    class _FakeAdmission:
+        def __init__(self, _path: object) -> None:
+            pass
+
+        def inspect(self, sid: str, **_kw: object) -> dict:
+            st = adm_state.get(sid, "missing")
+            return {"status": st, "enabled": st == "active"}
+
+        def active_lease(self, sid: str, **_kw: object) -> dict | None:
+            return {"token": f"tok-{sid}", "entry_enabled": True} if adm_state.get(sid) == "active" else None
+
+        def activate(self, sid: str, **_kw: object) -> dict:
+            adm_state[sid] = "active"
+            return {"token": f"tok-{sid}", "entry_enabled": True}
+
+    accepted_events: list[dict] = []
+    fake_act.Admission = _FakeAdmission
+    fake_ho.accept_stop = lambda eng_p, ev, **_kw: accepted_events.append({"eng": str(eng_p), **ev}) or {"stage": "accepted-local"}
+    monkeypatch.setitem(sys.modules, "mindie_knowledge.loop.activation", fake_act)
+
+    s_ok = run_stop_capture(profile, {"session_id": "s-auth", "cwd": str(ws_auth), "event_id": "ev-1"}, plugin_root=profile.plugin_root)
+    assert s_ok == {"stage": "accepted-local"}
+    assert adm_state.get("s-auth") == "active" and len(accepted_events) == 1
+    post_eng = json.loads(Path(accepted_events[0]["eng"]).read_text(encoding="utf-8"))
+    assert post_eng["capture_mode"] == "public-transcript"
+
+    adm_state["s-auth"] = "inactive"
+    s_revoked = run_stop_capture(profile, {"session_id": "s-auth", "cwd": str(ws_auth), "event_id": "ev-2"}, plugin_root=profile.plugin_root)
+    assert s_revoked == {"stage": "inert", "reason": "revoked"} and len(accepted_events) == 1

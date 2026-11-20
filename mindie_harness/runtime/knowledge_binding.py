@@ -263,6 +263,7 @@ def _ensure_in_process(
     retire_previous: bool,
     include_default_feed: bool,
     already_locked: bool,
+    force_public_transcript: bool = False,
 ) -> dict[str, Any]:
     from mindie_knowledge.loop import domain_catalog
     from mindie_knowledge.loop.cli import config_at, validate_config
@@ -305,7 +306,8 @@ def _ensure_in_process(
 
         adapter_py = _resolve_transcript_adapter(profile.host, plugin_root, prev_eng_doc)
         redactor_bin = _resolve_redactor(profile, install_redactor=install_redactor)
-        capture_ready = adapter_py.name != "noop_transcript_adapter.py" and Path(redactor_bin).is_file()
+        has_host_adapter = adapter_py.name != "noop_transcript_adapter.py"
+        capture_ready = has_host_adapter and (force_public_transcript or Path(redactor_bin).is_file())
         capture_mode = "public-transcript" if (capture_ready or not _supports_disabled_capture_mode()) else "disabled"
         comm_path = (profile.config_path.parent / "mindie-community.json").resolve(strict=False)
         consent_path = profile.consent_path.resolve(strict=False)
@@ -603,7 +605,11 @@ def _stop_in_process(
                 ):
                     resolved_cand = _resolve_transcript_adapter(profile.host, plugin_root, loaded_eng)
                     resolved_red = Path(_resolve_redactor(profile, install_redactor=False))
-                    if resolved_cand.name != "noop_transcript_adapter.py" and resolved_red.is_file():
+                    if resolved_cand.name != "noop_transcript_adapter.py" and (
+                        loaded_eng.get("capture_mode") == "disabled"
+                        or cur_adapter.name == "noop_transcript_adapter.py"
+                        or (not cur_redactor.is_file() and resolved_red.is_file())
+                    ):
                         needs_provision = True
                         retire_replaced = True
         except TimeoutError:
@@ -620,6 +626,7 @@ def _stop_in_process(
             retire_previous=retire_replaced,
             include_default_feed=False,
             already_locked=False,
+            force_public_transcript=True,
         )
         if ensured.get("status") != "configured":
             return {"stage": "unavailable", "reason": str(ensured.get("reason") or "configuration")}
@@ -627,8 +634,6 @@ def _stop_in_process(
 
     assert eng_path is not None
     engine_cfg = config_at(eng_path)
-    if engine_cfg.get("capture_mode") == "disabled":
-        return {"stage": "inert", "reason": "capture-disabled"}
     work_deadline = deadline.expires_at - deadline.cleanup_grace
     if time.monotonic() >= work_deadline:
         return {"stage": "unavailable", "reason": "budget-exhausted"}
@@ -650,6 +655,8 @@ def _stop_in_process(
         )
     if lease is None or not lease.get("token") or not lease.get("entry_enabled"):
         return {"stage": "inert", "reason": "not-activated"}
+    if engine_cfg.get("capture_mode") == "disabled":
+        return {"stage": "inert", "reason": "capture-disabled"}
 
     stop_event = dict(event)
     stop_event["hook_event_name"] = "Stop"
