@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 SEED_LOCK_SCHEMA = "mindie-harness-seed/1"
-SEED_VERSION = "0.1.7"
+SEED_VERSION = "0.1.8"
 MIN_FREE_BYTES = int(2.5 * (1024 ** 3))
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _WIN_EXTS = (".exe", ".cmd", ".bat", ".com", ".ps1")
@@ -643,7 +643,8 @@ def _provision_cold(host: str, plugin_root: Path, cfg_path: Path, *, smoke_modul
             if staged_wh is not None:
                 _run_owned_seed_cmd([uv_bin, "venv", "--python", base_py, str(venv_dir)], env=env, timeout=120.0)
                 req_b = staged_wh / "requirements.txt"
-                _run_owned_seed_cmd([uv_bin, "--native-tls", "pip", "install", "--python", str(venv_py), "--offline", "--no-index", "--find-links", str(staged_wh), "--override", str(req_b), "-r", str(req_b)], env=env, timeout=240.0)
+                off_flags = ["--offline", "--no-index"] if os.environ.get("UV_OFFLINE") == "1" else []
+                _run_owned_seed_cmd([uv_bin, "--native-tls", "pip", "install", "--python", str(venv_py), *off_flags, "--find-links", str(staged_wh), "--override", str(req_b), "-r", str(req_b)], env=env, timeout=240.0)
                 shutil.rmtree(bundle_wh, ignore_errors=True)
             elif pyproject.is_file():
                 cmd = [uv_bin, "--native-tls", "sync", "--no-editable", "--no-dev", "--python", base_py, "--project", str(plugin_root)]

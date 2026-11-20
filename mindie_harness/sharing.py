@@ -170,7 +170,7 @@ def _configure_with_providers(
 
     consent_path = profile.consent_path
     comm_path = community_path(profile)
-    diag_path = diagnostics_policy_path()
+    diag_path = diagnostics_policy_path(profile=profile)
     enabled = clean in {"contribute", "local-only"}
 
     try:
