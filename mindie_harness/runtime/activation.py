@@ -41,9 +41,15 @@ from ..atomic import (
     stage_retire_directory,
     sweep_trash_directories,
 )
+from ..component_commands import rebind_component_commands
 from ..locks import FileLock, LockTimeoutError, acquire_retirement_guard
 from ..paths import HOSTS, HarnessError, ProfileRef
 from .builder import BUILDING_SENTINEL, CANDIDATE_RECEIPT_SCHEMA, PreparedGeneration
+from .knowledge_binding import (
+    ensure_knowledge_binding,
+    has_knowledge_package,
+    restore_knowledge_retirement,
+)
 from .scheduler import discover_scheduled_executables
 
 PENDING_UPDATE_SCHEMA = "mindie-pending-update/1"
@@ -194,14 +200,19 @@ def _collect_protected_generations(
         doc = read_json_safe(cfg_file)
         if not isinstance(doc, dict):
             continue
-        for field_name in ("python", "component_release", "runtime_scripts"):
+        for field_name in ("python", "component_release", "runtime_scripts", "engine_config"):
             val = doc.get(field_name)
             if isinstance(val, str) and val.strip():
                 owner = _owning_generation_dir(val, gen_root)
                 if owner is not None:
                     protected.add(owner)
-                    if cfg_file == profile.config_path and active_gen is None:
+                    if cfg_file == profile.config_path and active_gen is None and field_name in {"python", "component_release"}:
                         active_gen = owner
+        dom_cfgs = doc.get("domain_configs")
+        if isinstance(dom_cfgs, Mapping):
+            for dom_val in dom_cfgs.values():
+                if isinstance(dom_val, str) and dom_val.strip():
+                    _protect(dom_val)
         current_ptr = doc.get("current_path")
         if isinstance(current_ptr, str) and current_ptr.strip():
             cur_doc = read_json_safe(current_ptr)
@@ -461,18 +472,31 @@ def activate_generation(
                         reportable=False,
                     )
 
+        knowledge_installed = has_knowledge_package(prepared.python_path)
         if (
             prev_python == str(prepared.python_path)
             and current_cfg.get("component_release") == str(prepared.generation_dir)
         ):
-            return ActivationResult(
-                status="noop",
-                config_path=profile.config_path,
-                generation_dir=prepared.generation_dir,
-                python_path=prepared.python_path,
-                previous_python=prev_python,
-                reportable=False,
+            eng_raw = current_cfg.get("engine_config")
+            dom_map = current_cfg.get("domain_configs")
+            binding_healthy = (
+                not knowledge_installed
+                or (
+                    isinstance(eng_raw, str)
+                    and Path(eng_raw).is_file()
+                    and isinstance(dom_map, Mapping)
+                    and len(dom_map) >= 9
+                )
             )
+            if binding_healthy:
+                return ActivationResult(
+                    status="noop",
+                    config_path=profile.config_path,
+                    generation_dir=prepared.generation_dir,
+                    python_path=prepared.python_path,
+                    previous_python=prev_python,
+                    reportable=False,
+                )
 
         new_cfg = dict(current_cfg)
         new_cfg.update(
@@ -487,13 +511,51 @@ def activate_generation(
         )
         new_cfg.setdefault("admission_path", str(profile.admission_db))
         new_cfg.setdefault("consent_config", str(profile.consent_path))
+        rebind_component_commands(new_cfg, str(prepared.python_path))
 
-        # Execute pre-commit migration (e.g., OS Scheduled Task or host package) BEFORE flipping <host>.json!
-        if on_before_commit is not None:
-            on_before_commit(profile, prepared, new_cfg)
+        kb_retirement: Mapping[str, Any] | None = None
+        if knowledge_installed:
+            kb_res = ensure_knowledge_binding(
+                profile,
+                plugin_root=profile.plugin_root,
+                python_executable=prepared.python_path,
+                install_redactor=False,
+                retire_previous=True,
+                already_locked=True,
+            )
+            if kb_res.get("status") == "deferred":
+                return ActivationResult(
+                    status="deferred",
+                    config_path=profile.config_path,
+                    generation_dir=prepared.generation_dir,
+                    python_path=prepared.python_path,
+                    previous_python=prev_python,
+                    reason=str(kb_res.get("reason") or "knowledge_service_busy"),
+                    reportable=False,
+                )
+            if isinstance(kb_res.get("retirement"), Mapping):
+                kb_retirement = kb_res["retirement"]
+            if isinstance(kb_res.get("binding_fields"), Mapping):
+                new_cfg.update(kb_res["binding_fields"])
 
-        # Authoritative host pointer commits LAST!
-        atomic_write_json(profile.config_path, new_cfg)
+        try:
+            # Execute pre-commit migration (e.g., OS Scheduled Task or host package) BEFORE flipping <host>.json!
+            if on_before_commit is not None:
+                on_before_commit(profile, prepared, new_cfg)
+
+            # Authoritative host pointer commits LAST!
+            atomic_write_json(profile.config_path, new_cfg)
+        except Exception:
+            if kb_retirement is not None:
+                try:
+                    restore_knowledge_retirement(
+                        profile,
+                        kb_retirement,
+                        python_executable=prepared.python_path,
+                    )
+                except Exception:
+                    pass
+            raise
         clear_pending_update_check(profile)
     finally:
         update_lock.release()
@@ -530,7 +592,9 @@ def maintain_generations(
     update_outcome: Any = None
     if pending is not None and builder_callback is not None:
         update_outcome = builder_callback(profile, pending)
-        clear_pending_update_check(profile)
+        outcome_view = update_outcome.to_dict() if hasattr(update_outcome, "to_dict") else update_outcome
+        if not (isinstance(outcome_view, Mapping) and outcome_view.get("status") == "deferred"):
+            clear_pending_update_check(profile)
     gc_res = reclaim_generations(
         profile,
         keep_paths=keep_paths,

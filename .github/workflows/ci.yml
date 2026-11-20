@@ -60,7 +60,7 @@ jobs:
           path: results.xml
 
   installed-artifact-smoke:
-    name: Out-of-Tree Wheel & MCP Handshake Smoke
+    name: Out-of-Tree Wheel & Candidate Selftest Smoke
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -86,12 +86,122 @@ jobs:
           "$SMOKE_ROOT/venv/bin/python" -I -c "import importlib.metadata as m; assert not [x for x in m.requires('mindie-harness') or [] if 'extra ==' not in x]"
           "$SMOKE_ROOT/venv/bin/mindie-harness" --version
           "$SMOKE_ROOT/venv/bin/mindie-harness" inspect --host codex
-          printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mindie_status","arguments":{}}}\n' \
-            | "$SMOKE_ROOT/venv/bin/mindie-harness" --host codex mcp tools
+          "$SMOKE_ROOT/venv/bin/mindie-harness" --host codex selftest --mode candidate --json
+          MCP_OUT="$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mindie_status","arguments":{}}}\n' \
+            | "$SMOKE_ROOT/venv/bin/mindie-harness" --host codex mcp tools)"
+          MCP_OUT="$MCP_OUT" "$SMOKE_ROOT/venv/bin/python" -I -c 'import json, os; lines = [json.loads(x) for x in os.environ["MCP_OUT"].splitlines() if x.strip()]; assert len(lines) == 2 and lines[1]["result"]["isError"] is False'
+
+  fullstack-wheelhouse-smoke:
+    name: Full-Stack Wheelhouse & Selftest (`${{ matrix.os }}`)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      MINDIE_REQUIRE_FULLSTACK: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+          python-version: '3.12'
+      - name: Build Candidate `mindie-harness` Wheel
+        run: uv build
+      - name: Assemble Candidate Wheelhouse & Run Fail-Closed Full-Stack Selftest
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+          import os
+          import re
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          import tempfile
+
+          repo = Path.cwd()
+          sys.path.insert(0, str(repo))
+          from mindie_harness.paths import venv_python_path
+          from mindie_harness.process.win32 import repair_venv_pythonw_if_needed
+          from mindie_harness.runtime.wheelhouse_assets import (
+              BUNDLE_NAME,
+              asset_source,
+              download_verified,
+              extract_wheel_bundle_safely,
+              fetch_checksums,
+          )
+
+          cand_wheels = sorted((repo / "dist").glob("mindie_harness-*.whl"))
+          assert len(cand_wheels) == 1, f"Expected 1 candidate wheel, found {cand_wheels}"
+          cand_wheel = cand_wheels[0]
+          cand_ver = cand_wheel.name.split("-")[1]
+
+          with tempfile.TemporaryDirectory(prefix="mindie-ci-fs-", ignore_cleanup_errors=(os.name == "nt")) as raw_tmp:
+              tmp = Path(raw_tmp)
+              base_url = "https://github.com/mindie-agent/mindie-agent/releases/latest/download"
+              sums, ok = fetch_checksums(base_url, timeout=60.0)
+              assert ok and BUNDLE_NAME in sums, f"Missing {BUNDLE_NAME} in SHA256SUMS"
+              tar_path = tmp / BUNDLE_NAME
+              download_verified(asset_source(base_url, BUNDLE_NAME), tar_path, sums[BUNDLE_NAME], timeout=120.0)
+              wh = extract_wheel_bundle_safely(tar_path, tmp / "wheelhouse")
+              for old_whl in list(wh.glob("mindie_harness-*.whl")):
+                  old_whl.unlink()
+              shutil.copy2(cand_wheel, wh / cand_wheel.name)
+
+              req_file = wh / "requirements.txt"
+              assert req_file.is_file(), "Bundle missing requirements.txt"
+              req_text = req_file.read_text(encoding="utf-8")
+              req_text = re.sub(r"(?m)^mindie-harness==[^\s]+$", f"mindie-harness=={cand_ver}", req_text)
+              req_file.write_text(req_text, encoding="utf-8")
+
+              # Prepend fail-closed git trap during wheelhouse installation to prove 100% Zero-Git install!
+              trap_dir = tmp / "git-trap"
+              trap_dir.mkdir()
+              if os.name == "nt":
+                  (trap_dir / "git.cmd").write_text("@echo off\r\necho FORBIDDEN_GIT_CLONE 1>&2\r\nexit /b 99\r\n", encoding="utf-8")
+              else:
+                  g = trap_dir / "git"
+                  g.write_text("#!/bin/sh\necho FORBIDDEN_GIT_CLONE >&2\nexit 99\n", encoding="utf-8")
+                  g.chmod(g.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+              venv_dir = tmp / "venv"
+              subprocess.run(["uv", "venv", "--python", sys.executable, str(venv_dir)], check=True)
+              vpy = venv_python_path(venv_dir)
+              install_env = dict(os.environ, PATH=f"{trap_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+              subprocess.run(
+                  [
+                      "uv", "--native-tls", "pip", "install",
+                      "--python", str(vpy),
+                      "--find-links", str(wh),
+                      "--override", str(req_file),
+                      "-r", str(req_file),
+                      "pytest>=8.0",
+                  ],
+                  env=install_env,
+                  check=True,
+              )
+              if os.name == "nt":
+                  repair_venv_pythonw_if_needed(venv_dir, sys.executable)
+
+              run_env = dict(os.environ, MINDIE_REQUIRE_FULLSTACK="1")
+              subprocess.run([str(vpy), "-I", "-X", "utf8", "-m", "pytest", "-q", str(repo / "tests" / "tier1" / "test_knowledge_loop_integration.py")], env=run_env, check=True)
+              st = subprocess.run([str(vpy), "-I", "-X", "utf8", "-m", "mindie_harness.cli", "--host", "codex", "selftest", "--mode", "full", "--json"], env=run_env, capture_output=True, text=True)
+              print(st.stdout)
+              if st.stderr:
+                  print(st.stderr, file=sys.stderr)
+              assert st.returncode == 0, f"selftest --mode full exited {st.returncode}"
+              report = json.loads(st.stdout.strip().splitlines()[-1])
+              assert report["schema"] == "mindie-selftest/1" and report["status"] == "passed", report
 
   release-ready:
     name: release-ready
-    needs: [governance, test, installed-artifact-smoke]
+    needs: [governance, test, installed-artifact-smoke, fullstack-wheelhouse-smoke]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

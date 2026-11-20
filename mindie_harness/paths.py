@@ -241,7 +241,22 @@ def open_wal_database(
         )
     if create:
         db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    conn = sqlite3.connect(str(db_path), timeout=SQLITE_MIN_BUDGET_SECONDS)
+        conn = sqlite3.connect(str(db_path), timeout=SQLITE_MIN_BUDGET_SECONDS)
+    else:
+        try:
+            conn = sqlite3.connect(
+                f"{db_path.resolve().as_uri()}?mode=rw",
+                uri=True,
+                timeout=SQLITE_MIN_BUDGET_SECONDS,
+            )
+        except sqlite3.OperationalError:
+            if not db_path.is_file():
+                return None
+            conn = sqlite3.connect(
+                f"{db_path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=SQLITE_MIN_BUDGET_SECONDS,
+            )
     try:
         if create and os.name != "nt":
             try:
@@ -251,8 +266,9 @@ def open_wal_database(
             except OSError:
                 pass
         conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        if create:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-2048")
         if deadline is not None:
             def _check_deadline() -> int:
@@ -415,6 +431,43 @@ def resolve_host_python(env: Mapping[str, str] | None = None) -> Path:
         retryable=False,
         reportable=False,
     )
+
+
+def same_interpreter(first: str | Path | None, second: str | Path | None) -> bool:
+    """Compare two Python interpreter paths without collapsing venv symlinks onto base CPython."""
+    if not first or not second:
+        return False
+    left = os.path.normcase(os.path.abspath(os.path.expanduser(str(first))))
+    right = os.path.normcase(os.path.abspath(os.path.expanduser(str(second))))
+    return left == right
+
+
+def resolve_base_cpython(candidate: str | Path | None = None, env: Mapping[str, str] | None = None) -> Path:
+    """Unwrap `pyvenv.cfg` `home` so new venv builds target real base CPython rather than nesting venvs."""
+    py = Path(candidate) if candidate is not None else resolve_host_python(env)
+    for cfg in (py.parent.parent / "pyvenv.cfg", py.parent / "pyvenv.cfg"):
+        try:
+            if not cfg.is_file():
+                continue
+            for raw_line in cfg.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                key, sep, val = raw_line.partition("=")
+                if sep and key.strip().lower() == "home" and val.strip():
+                    home_dir = Path(val.strip())
+                    names = ("python.exe", "python3.exe") if os.name == "nt" else ("python3", "python")
+                    for name in names:
+                        base_cand = home_dir / name
+                        if base_cand.is_file() and not is_windows_store_stub(base_cand):
+                            return base_cand
+        except TimeoutError:
+            raise
+        except OSError:
+            continue
+    base_exec = getattr(sys, "_base_executable", None)
+    if candidate is None and isinstance(base_exec, str) and base_exec:
+        bp = Path(base_exec)
+        if bp.is_file() and not is_windows_store_stub(bp):
+            return bp
+    return py
 
 
 def _norm_abs(path: str | Path) -> Path:

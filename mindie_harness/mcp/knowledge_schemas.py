@@ -10,7 +10,8 @@ Declares `KNOWLEDGE_NAMES` and the 5 canonical `KNOWLEDGE_TOOL_SCHEMAS`
 - Read tools (`knowledge_query`, `knowledge_explain`) set `readOnlyHint=True`;
   network-writing tools (`knowledge_sync`) set `openWorldHint=True`.
 - Every schema keeps `additionalProperties=False`; the MCP router strips legacy
-  correlation keys before validation.
+  correlation keys before validation, and `rsi.rsi_explore.schema_properties()` is
+  the single source of truth for RSI explore properties.
 
 [Timeouts & Locks]
 - Pure in-memory constants (`< 0.1ms`); no I/O, locks, or deadlines.
@@ -22,6 +23,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..rsi.rsi_explore import schema_properties
+
 KNOWLEDGE_NAMES: tuple[str, ...] = (
     "knowledge_query",
     "knowledge_explain",
@@ -29,13 +32,9 @@ KNOWLEDGE_NAMES: tuple[str, ...] = (
     "knowledge_distill",
     "knowledge_sync",
 )
-_RSI_PROPERTIES: dict[str, Any] = {
-    "mode": {"type": "string", "enum": ["reuse", "diagnose", "explore"]},
-    "ledger_entries": {"type": "array", "items": {"type": "object"}},
-    "bottleneck_summary": {"type": "object"},
-    "native_subcontext": {"type": "boolean"},
-    "goal": {"type": "string"},
-}
+
+_RSI_PROPS: dict[str, Any] = schema_properties()
+
 KNOWLEDGE_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "knowledge_query",
@@ -47,16 +46,19 @@ KNOWLEDGE_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "query": {"type": "string"},
                 "domain": {"type": "string"},
+                "domain_path": {"type": "string"},
                 "conditions": {"type": "object"},
-                "known_refs": {"type": "array", "items": {"type": "string"}},
                 "token_budget": {"type": "integer", "minimum": 1, "maximum": 64000},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                 "continuation": {"type": "string"},
                 "navigation_only": {"type": "boolean"},
+                "include_unknown": {"type": "boolean"},
+                "include_archived": {"type": "boolean"},
+                "known_refs": {"type": "array", "items": {"type": "string"}},
                 "run_id": {"type": "string"},
-                **_RSI_PROPERTIES,
+                **_RSI_PROPS,
             },
-            "required": ["query"],
+            "required": [],
         },
     },
     {
@@ -69,13 +71,14 @@ KNOWLEDGE_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "ref": {"type": "string"},
                 "refs": {"type": "array", "items": {"type": "string"}},
+                "domain": {"type": "string"},
                 "conditions": {"type": "object"},
                 "known_refs": {"type": "array", "items": {"type": "string"}},
                 "token_budget": {"type": "integer", "minimum": 1, "maximum": 64000},
                 "run_id": {"type": "string"},
-                **_RSI_PROPERTIES,
+                **_RSI_PROPS,
             },
-            "required": ["ref"],
+            "required": [],
         },
     },
     {
@@ -87,6 +90,7 @@ KNOWLEDGE_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "additionalProperties": False,
             "properties": {
                 "ref": {"type": "string"},
+                "domain": {"type": "string"},
                 "rating": {"type": "string", "enum": ["up", "down"]},
                 "reason": {"type": "string"},
                 "event_type": {"type": "string", "enum": ["discovered", "loaded", "applied", "evaluated"]},
@@ -111,6 +115,8 @@ KNOWLEDGE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "proposal": {"type": "object"},
                 "related_refs": {"type": "array", "items": {"type": "string"}},
                 "domain": {"type": "string"},
+                "topic": {"type": "string"},
+                "target_signature": {"type": "string"},
             },
             "required": ["inputs", "task_state"],
         },

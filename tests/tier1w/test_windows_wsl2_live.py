@@ -38,6 +38,7 @@ from mindie_harness.process.posix import which_posix_binary  # noqa: E402
 from mindie_harness.process.win32 import (  # noqa: E402
     probe_current_job,
     read_pe_subsystem,
+    repair_venv_pythonw_if_needed,
     verify_gui_subsystem,
 )
 from mindie_harness.runtime.activation import reclaim_generations  # noqa: E402
@@ -67,27 +68,46 @@ def _win_snapshot_conhost_and_visible_windows() -> tuple[set[int], set[int]]:
 
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    conhosts: set[int] = set()
+    parent_map: dict[int, int] = {}
+    exe_map: dict[int, str] = {}
     if snap and snap != ctypes.c_void_p(-1).value:
         try:
             entry = PROCESSENTRY32W()
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
             if k32.Process32FirstW(snap, ctypes.byref(entry)):
                 while True:
-                    if entry.szExeFile.lower() == "conhost.exe":
-                        conhosts.add(int(entry.th32ProcessID))
+                    pid = int(entry.th32ProcessID)
+                    parent_map[pid] = int(entry.th32ParentProcessID)
+                    exe_map[pid] = entry.szExeFile.lower()
                     if not k32.Process32NextW(snap, ctypes.byref(entry)):
                         break
         finally:
             k32.CloseHandle(snap)
 
+    root_pid = os.getpid()
+    tree_pids: set[int] = {root_pid}
+    added = True
+    while added:
+        added = False
+        for pid, ppid in parent_map.items():
+            if ppid in tree_pids and pid not in tree_pids:
+                tree_pids.add(pid)
+                added = True
+
+    conhosts = {pid for pid in tree_pids if exe_map.get(pid) == "conhost.exe"}
+
     u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    u32.GetWindowThreadProcessId.restype = wintypes.DWORD
     visible_hwnds: set[int] = set()
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     def _cb(hwnd: int, _lparam: int) -> bool:
         if u32.IsWindowVisible(hwnd):
-            visible_hwnds.add(int(hwnd))
+            owner_pid = wintypes.DWORD(0)
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+            if int(owner_pid.value) in tree_pids:
+                visible_hwnds.add(int(hwnd))
         return True
 
     u32.EnumWindows(WNDENUMPROC(_cb), 0)
@@ -191,6 +211,7 @@ class Tier1WLiveSuite(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows 11 zero-conhost & PE Subsystem==2 test")
     def test_win32_zero_conhost_and_pe_subsystem_guard(self) -> None:
         real_py = Path(sys.executable)
+        repair_venv_pythonw_if_needed(real_py.parent.parent)
         real_pyw = real_py.with_name("pythonw.exe")
         self.assertEqual(read_pe_subsystem(real_py), 3)
         self.assertTrue(real_pyw.is_file())

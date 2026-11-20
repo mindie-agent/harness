@@ -6,8 +6,9 @@ Declares the optional `mode`, `ledger_entries`, `bottleneck_summary`,
 protocol boundary across all 7 host plugins before forwarding to `knowledge`.
 
 [Invariants]
-- `mode` is strictly `reuse`, `diagnose`, or `explore`; unknown modes and malformed
-  `ledger_entries` / `bottleneck_summary` are rejected before any lease or RPC call.
+- `mode` is strictly `reuse`, `diagnose`, or `explore`; unknown modes, malformed
+  `ledger_entries` / `bottleneck_summary`, string booleans (`"false"`), and
+  non-string `goal` values are rejected before any lease or RPC call.
 - Normalization populates optional keys with declared defaults without inventing a mode.
 
 [Timeouts & Locks]
@@ -44,7 +45,10 @@ def schema_properties() -> dict[str, Any]:
 def parse_args(arguments: Mapping[str, Any] | None) -> dict[str, Any]:
     """Validate RSI arguments and return a normalized copy."""
     body = dict(arguments or {})
-    mode = str(body.get("mode", "reuse") or "reuse")
+    raw_mode = body.get("mode", "reuse")
+    if raw_mode is not None and not isinstance(raw_mode, str):
+        raise ValueError("mode must be one of reuse, diagnose or explore")
+    mode = raw_mode if isinstance(raw_mode, str) and raw_mode else "reuse"
     if mode not in MODES:
         raise ValueError("mode must be one of reuse, diagnose or explore")
     ledger = body.get("ledger_entries")
@@ -56,11 +60,23 @@ def parse_args(arguments: Mapping[str, Any] | None) -> dict[str, Any]:
     bottleneck = body.get("bottleneck_summary")
     if bottleneck is not None and not isinstance(bottleneck, dict):
         raise ValueError("bottleneck_summary must be an object")
+    raw_subctx = body.get("native_subcontext", False)
+    if raw_subctx is None:
+        subctx = False
+    elif isinstance(raw_subctx, bool):
+        subctx = raw_subctx
+    elif type(raw_subctx) is int and raw_subctx in {0, 1}:
+        subctx = bool(raw_subctx)
+    else:
+        raise ValueError("native_subcontext must be a boolean")
+    raw_goal = body.get("goal", "")
+    if raw_goal is not None and not isinstance(raw_goal, str):
+        raise ValueError("goal must be a string")
     body["mode"] = mode
     body["ledger_entries"] = ledger
     body["bottleneck_summary"] = bottleneck
-    body["native_subcontext"] = bool(body.get("native_subcontext", False))
-    body["goal"] = str(body.get("goal", "") or "")
+    body["native_subcontext"] = subctx
+    body["goal"] = raw_goal or ""
     return body
 
 

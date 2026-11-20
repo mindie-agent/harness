@@ -38,7 +38,7 @@ from typing import Any, Sequence
 import xml.etree.ElementTree as ET
 
 from ..atomic import atomic_write_bytes, atomic_write_text
-from ..paths import HarnessError, ProfileRef
+from ..paths import HarnessError, ProfileRef, config_home, diagnostics_root
 from ..process.posix import which_posix_binary
 from ..process.supervisor import Deadline, ProcessSpec, run_owned
 from ..process.win32 import verify_gui_subsystem
@@ -427,6 +427,18 @@ def discover_scheduled_executables(
     """Return executable/script paths referenced by OS schedules so GC keeps their venvs alive."""
     paths: set[Path] = set()
     scan_dirs: list[Path] = [Path(d) for d in extra_dirs]
+    diag_cfg_env = os.environ.get("MINDIE_DIAGNOSTICS_CONFIG")
+    diag_cfg_path = (
+        Path(diag_cfg_env).expanduser()
+        if diag_cfg_env
+        else (profile.config_path.parent / "diagnostics.json" if profile is not None else config_home() / "diagnostics.json")
+    )
+    scan_dirs.extend(
+        [
+            diag_cfg_path.with_name(f"{diag_cfg_path.name}.state") / "service",
+            diagnostics_root() / "service",
+        ]
+    )
     if profile is not None:
         scan_dirs.extend([profile.state_dir, profile.data_dir / "update"])
     if sys.platform == "darwin":
@@ -443,7 +455,7 @@ def discover_scheduled_executables(
                     if not entry.is_file():
                         continue
                     lower = entry.name.lower()
-                    if ("mindie" in lower or "kimi" in lower) and lower.endswith(
+                    if ("mindie" in lower or "kimi" in lower or "diagnostics" in lower or "reporter" in lower) and lower.endswith(
                         (".plist", ".pyw", ".xml", ".service", ".timer")
                     ):
                         paths.update(_extract_paths_from_file(Path(entry.path)))
@@ -456,30 +468,46 @@ def discover_scheduled_executables(
             continue
 
     if os.name == "nt" and task_names and shutil.which("powershell"):
-        for tname in task_names:
-            escaped = str(tname).replace("'", "''")
-            ps = (
-                "$ErrorActionPreference='SilentlyContinue'; "
-                f"$xml = Export-ScheduledTask -TaskName '{escaped}'; "
-                "if ($xml) { $b=[Text.UTF8Encoding]::new($false).GetBytes([string]$xml); "
-                "$o=[Console]::OpenStandardOutput(); $o.Write($b,0,$b.Length); $o.Flush() }"
+        explicit_names = [str(t).replace("'", "''") for t in task_names if str(t).strip()]
+        quoted_list = ", ".join(f"'{n}'" for n in explicit_names)
+        filter_expr = f"$_.TaskName -in @({quoted_list}) -or $_.TaskName -eq 'MindIEKimiUpdate' -or $_.TaskName -like 'MindIE*'"
+        ps = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            f"$tasks = Get-ScheduledTask -TaskPath '\\' | Where-Object {{ {filter_expr} }}; "
+            "foreach ($t in $tasks) { "
+            "$xml = Export-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath; "
+            "if ($xml) { $b=[Text.UTF8Encoding]::new($false).GetBytes([string]$xml + \"`n---MINDIE_TASK_SEP---`n\"); "
+            "$o=[Console]::OpenStandardOutput(); $o.Write($b,0,$b.Length); $o.Flush() } }"
+        )
+        try:
+            out = run_owned(
+                ProcessSpec(
+                    argv=("powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps),
+                    allowed_returncodes=None,
+                    role="background_maintenance",
+                ),
+                deadline=10.0,
             )
-            try:
-                out = run_owned(
-                    ProcessSpec(
-                        argv=("powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps),
-                        allowed_returncodes=None,
-                        role="background_maintenance",
-                    ),
-                    deadline=10.0,
-                )
-                if out.returncode == 0 and out.stdout.strip():
-                    root = ET.fromstring(out.stdout.lstrip("\ufeff"))
+            if out is not None and out.returncode == 0 and out.stdout.strip():
+                for raw_chunk in out.stdout.split("---MINDIE_TASK_SEP---"):
+                    chunk = raw_chunk.strip().lstrip("\ufeff")
+                    if not chunk:
+                        continue
+                    try:
+                        root = ET.fromstring(chunk)
+                    except ET.ParseError:
+                        continue
                     for exec_node in root.findall("./{*}Actions/{*}Exec"):
                         cmd = exec_node.findtext("{*}Command")
                         if cmd:
                             paths.add(Path(cmd.strip()))
-            except (TimeoutError, HarnessError, ET.ParseError, OSError):
-                continue
+                        args_txt = exec_node.findtext("{*}Arguments") or ""
+                        for m in _QUOTED_PATH_RE.finditer(args_txt):
+                            arg_path = Path(m.group(1))
+                            paths.add(arg_path)
+                            if arg_path.suffix.lower() == ".pyw" and arg_path.is_file():
+                                paths.update(_extract_paths_from_file(arg_path))
+        except (TimeoutError, HarnessError, OSError):
+            pass
 
     return paths

@@ -527,7 +527,23 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
     def _timeout_claim_bind(**_kwargs: object) -> None:
         raise TimeoutError("simulated bind SQLite deadline exceeded")
 
+    # Read-only calls with `_meta.session_id` skip `claim_bind` completely (zero writer lock!).
     monkeypatch.setattr(router.binds, "claim_bind", _timeout_claim_bind)
+    ro_no_lock = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "kq-readonly-no-claim-bind",
+            "method": "tools/call",
+            "params": {
+                "name": "knowledge_query",
+                "arguments": {"query": "x"},
+                "_meta": {"session_id": "s-readonly-fastlane"},
+            },
+        }
+    )
+    assert ro_no_lock["isError"] is False
+
+    # Explicit `_meta.bind_id` pre-dispatch `TimeoutError` -> `not_sent`; post-dispatch `TimeoutError` -> `uncertain`.
     pre_to_res = router.call_tool(
         {
             "jsonrpc": "2.0",
@@ -536,7 +552,7 @@ def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
             "params": {
                 "name": "knowledge_query",
                 "arguments": {"query": "x"},
-                "_meta": {"session_id": "s-pre-timeout"},
+                "_meta": {"bind_id": "b-pre-timeout"},
             },
         }
     )

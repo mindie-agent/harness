@@ -230,15 +230,27 @@ def installed_package_version(python_exe: str, package: str) -> str | None:
 def check_component_version_floors(profile: ProfileRef, selection: RuntimeSelection) -> None:
     """Refuse a candidate that would downgrade an installed standard component CLI."""
     cfg = read_json_safe(profile.config_path)
-    if not isinstance(cfg, dict) or not isinstance(cfg.get("component_commands"), dict):
+    if not isinstance(cfg, dict):
         return
+    commands = cfg.get("component_commands") if isinstance(cfg.get("component_commands"), dict) else {}
+    cfg_py = cfg.get("python") if isinstance(cfg.get("python"), str) and Path(cfg["python"]).is_file() else None
+
     for key, (package, module) in STANDARD_COMPONENT_COMMANDS.items():
-        argv = command_argv(cfg["component_commands"].get(key))
-        if not argv or not is_standard_module_command(argv, module):
+        if key in commands:
+            argv = command_argv(commands.get(key))
+            if not argv or not is_standard_module_command(argv, module):
+                continue
+            probe_py = argv[0]
+        elif cfg_py is not None:
+            probe_py = cfg_py
+        else:
             continue
-        installed = installed_package_version(argv[0], package)
+
         target = str((selection.components.get(package) or selection.components.get(key) or {}).get("version") or "")
-        if installed and target:
+        if not target:
+            continue
+        installed = installed_package_version(probe_py, package)
+        if installed:
             try:
                 if parse_version_key(target) < parse_version_key(installed):
                     raise _fail(

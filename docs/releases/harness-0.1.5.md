@@ -1,0 +1,9 @@
+# mindie-harness 0.1.5：9 域知识绑定编排、跨组件双工契约对齐与客户端/全栈 `selftest` 可用性门禁
+
+[English](harness-0.1.5.en.md)
+
+`mindie-harness v0.1.5` 正式发布。在完整保持 `API_VERSION = 1` 与核心零第三方重依赖（`dependencies = []`）的前提下，基于 #7 系统性补齐共享底座与 8 个运行时组件、7 款宿主插件之间的跨仓调用契约，并内置切换前候选代探针与零 Mock 全栈自检引擎（`mindie_harness.selftest`）：
+
+- **内容寻址 9 域知识引擎编排与撤销不可逆语义（`runtime/knowledge_binding.py` · `mcp/knowledge_rpc.py` · `mcp/knowledge_schemas.py`）**：统一在安装、更新、冷启动及首次调用时通过 `domain_catalog.prepare` 注册全部 9 大公开知识域并输出内容寻址 `<config_home>/engines/<host>/<20hex>/<domain>.engine.json`，切换时自动调用 `retire_changed(..., include_default=True)`，根治原地覆写导致的 `.retired` 死锁与零 Git 安装缺配置故障；无 `gitleaks` 或独立安装场景自动置 `capture_mode="disabled"` 保障开箱只读检索；统一 `run_stop_capture` 与 `knowledge_distill` 授权/范围判定并严格尊重 `inactive` 撤销状态；补齐批量 `explain(refs=...)`、分页 `query(continuation=...)` Schema 与 `450s` 内层预算。
+- **跨组件双工管道与会话隔离加固（`mcp/router.py` · `mcp/gateway_dispatch.py` · `component_commands.py` · `mcp/doctor.py` · `sharing.py`）**：移除请求热路径前置 `claim_bind` 写锁并放行工具 Schema 合法声明的 `session_id` 句柄参数；子解释器回退全面改走 `stdin`/`stdout` 单行帧传输（杜绝 `sys.argv` 明文泄漏与 Win32 `32 KB` 溢出，且不向子 `.venv` 注入父目录 `sys.path`）；接入 `remote_dev` `session_scope` 隔离并发会话账本；为 `rsi_loop` / `experiment_ledger` 补齐 `stdin_json`、为 `debugger` 补齐 `stdin_text`、将 `sim` 切换至 `mindie_sim.cli`、补齐 `npu_top` 默认参数与全部 8 项标准组件重绑；修复引导 Python 下 `mindie_doctor` 解释器选择及 `sharing.py` 加锁写入与 `reporting_revision` 幂等保持。
+- **Windows `pythonw.exe` 自动修复、守护进程 Job 脱离与双模式全栈自检（`runtime/builder.py` · `bootstrap/seed_main.py` · `process/win32.py` · `selftest.py`）**：针对 `uv <= 0.12.3` 生成的控制台壳 `pythonw.exe`（PE `Subsystem == 3`）自动从基底 CPython `venvwlauncher.exe` 修复并通过双层 `Subsystem == 2` 核验；支持 `coordinator` 常驻守护进程脱离单次前台 Win32 Job；新增 `mindie-harness selftest --mode candidate`（`< 2.5s` 嵌入 `prepare_candidate_runtime` 切换前阻断坏候选代）与 `--mode full`（跨直连与子进程双拓扑、双帧零 Mock 验证全表面 MCP 工具与组件），同步更新 `dist/mindie-harness-seed.pyz` 与三平台全栈 CI。

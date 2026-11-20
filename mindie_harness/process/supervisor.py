@@ -159,6 +159,7 @@ class ProcessSpec:
     below_normal_priority: bool = False
     require_gui_subsystem: bool = False
     allowed_returncodes: tuple[int, ...] | None = (0,)
+    allow_daemon_breakaway: bool = False
 
     def __post_init__(self) -> None:
         if not self.argv or any(not isinstance(a, str) or not a for a in self.argv):

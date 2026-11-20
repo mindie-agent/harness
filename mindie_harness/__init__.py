@@ -1,7 +1,7 @@
 """MindIE Harness (`mindie_harness`): pure-stdlib shared substrate for all 7 host plugins.
 
 [Role]
-Root package exporting `API_VERSION = 1`, `__version__ = "0.1.4"`, and the stable
+Root package exporting `API_VERSION = 1`, `__version__ = "0.1.5"`, and the stable
 public facade from `mindie_harness.api`. Placed at repository root (`harness/mindie_harness/`)
 so `mindie_diagnostics/triage_card.py` (`layout == "package"`) resolves GitHub
 source permalinks cleanly.
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Final
 
-__version__: Final[str] = "0.1.4"
+__version__: Final[str] = "0.1.5"
 API_VERSION: Final[int] = 1
 
 from .api import (
@@ -73,6 +73,7 @@ __all__ = [
     "__version__",
     "activate_runtime",
     "configure_sharing",
+    "ensure_knowledge_binding",
     "inspect_profile",
     "maintain_runtime",
     "open_database",
@@ -80,6 +81,8 @@ __all__ = [
     "prepare_runtime",
     "run_host",
     "run_owned",
+    "run_selftest",
+    "run_stop_capture",
     "serve_mcp",
     "sharing_status",
     "update_runtime",
@@ -87,7 +90,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """Lazily expose sharing/update symbols to keep cold import stdlib-only."""
+    """Lazily expose sharing/update/binding/selftest symbols to keep cold import stdlib-only."""
     if name == "ManagedMCPAdapter":
         from .mcp.gateway import ManagedMCPAdapter
 
@@ -100,4 +103,12 @@ def __getattr__(name: str):
         from .runtime.wheelhouse import update_runtime
 
         return update_runtime
+    if name in {"ensure_knowledge_binding", "run_stop_capture"}:
+        from .runtime.knowledge_binding import ensure_knowledge_binding, run_stop_capture
+
+        return {"ensure_knowledge_binding": ensure_knowledge_binding, "run_stop_capture": run_stop_capture}[name]
+    if name == "run_selftest":
+        from .selftest import run_selftest
+
+        return run_selftest
     raise AttributeError(name)

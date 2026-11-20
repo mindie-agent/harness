@@ -40,12 +40,13 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 import uuid
 
-from ..atomic import atomic_write_json, read_json_safe
+from ..atomic import atomic_write_json, atomic_write_text, read_json_safe
 from ..component_commands import rebind_component_commands
-from ..paths import HarnessError, ProfileRef, resolve_host_python, venv_python_path
+from ..paths import HarnessError, ProfileRef, resolve_base_cpython, venv_python_path
 from ..process.posix import which_posix_binary
 from ..process.supervisor import Deadline, ProcessSpec, run_owned
 from .activation import activate_generation
+from .knowledge_binding import ensure_knowledge_binding, has_knowledge_package
 from .wheelhouse_assets import (
     BUNDLE_NAME, CHECKSUM_NAME, asset_source, check_component_version_floors,
     download_verified, extract_wheel_bundle_safely, fetch_checksums, parse_sha256sums, read_asset_text,
@@ -337,12 +338,56 @@ def stage_wheelhouse(
         channel_components = _normalize_components(payload.get("components"))
         target = selection.components if selection is not None else channel_components
         if selection is not None:
-            target = {name: {**channel_components.get(name, {}), **meta} for name, meta in target.items()}
+            merged_target = dict(channel_components)
+            for name, meta in selection.components.items():
+                merged_target[name] = {**channel_components.get(name, {}), **meta}
+            target = merged_target
         if not used_bundle:
             _stage_component_wheels(payload, target, dest, timeout=timeout, allow_remote=not offline, deadline=deadline)
-        wheels = list(dest.glob("*.whl"))
+        elif selection is not None:
+            overridden = {
+                name: meta
+                for name, meta in target.items()
+                if meta.get("version") != (channel_components.get(name) or {}).get("version")
+                or meta.get("revision") != (channel_components.get(name) or {}).get("revision")
+            }
+            if overridden:
+                for pkg_name in overridden:
+                    dist_prefix = pkg_name.replace("-", "_").lower() + "-"
+                    for old_whl in list(dest.glob("*.whl")):
+                        if old_whl.name.lower().startswith(dist_prefix):
+                            old_whl.unlink(missing_ok=True)
+                _stage_component_wheels(payload, overridden, dest, timeout=timeout, allow_remote=not offline, deadline=deadline)
+                (dest / "requirements.lock").unlink(missing_ok=True)
+                req_txt = dest / "requirements.txt"
+                if req_txt.is_file():
+                    updated_lines: list[str] = []
+                    override_versions = {
+                        k.replace("_", "-").lower(): str(v.get("version") or "")
+                        for k, v in overridden.items()
+                        if v.get("version")
+                    }
+                    for raw_line in req_txt.read_text(encoding="utf-8").splitlines():
+                        stripped = raw_line.strip()
+                        pkg_head = stripped.split("==")[0].split("[")[0].replace("_", "-").lower() if "==" in stripped else ""
+                        if pkg_head in override_versions:
+                            extra_part = "[" + stripped.split("==")[0].split("[", 1)[1] if "[" in stripped.split("==")[0] else ""
+                            updated_lines.append(f"{pkg_head}{extra_part}=={override_versions[pkg_head]}")
+                        else:
+                            updated_lines.append(raw_line)
+                    atomic_write_text(req_txt, "\n".join(updated_lines) + "\n")
+        wheels = sorted(dest.glob("*.whl"))
         if not wheels:
             raise _fail("wheelhouse_unavailable", "No prebuilt wheel bundle or per-component release wheel was available")
+        if not (dest / "requirements.lock").is_file() and not (dest / "requirements.txt").is_file():
+            pinned_lines: list[str] = []
+            for whl in wheels:
+                parts = whl.name.split("-")
+                if len(parts) >= 3:
+                    dist_norm = parts[0].replace("_", "-")
+                    pinned_lines.append(f"{dist_norm}=={parts[1]}")
+            if pinned_lines:
+                atomic_write_text(dest / "requirements.txt", "\n".join(sorted(set(pinned_lines))) + "\n")
         return dest
     except BaseException:
         if dest_dir is None:
@@ -358,7 +403,7 @@ def _resolve_uv(env: Mapping[str, str]) -> str:
 def _wheelhouse_builder(profile: ProfileRef, wheelhouse: Path, *, offline: bool):
     def _builder(gen_dir: Path, venv_dir: Path, build_env: dict[str, str], deadline: Deadline) -> None:
         uv_bin = _resolve_uv(build_env)
-        run_owned(ProcessSpec(argv=(uv_bin, "venv", "--python", str(resolve_host_python(build_env)), str(venv_dir)), env=build_env, role="background_maintenance", memory_limit_bytes=None), deadline=deadline)
+        run_owned(ProcessSpec(argv=(uv_bin, "venv", "--python", str(resolve_base_cpython(None, build_env)), str(venv_dir)), env=build_env, role="background_maintenance", memory_limit_bytes=None), deadline=deadline)
         cmd = [uv_bin, "--native-tls", "pip", "install", "--python", str(venv_python_path(venv_dir)), "--find-links", str(wheelhouse)]
         req_file = next((wheelhouse / n for n in ("requirements.lock", "requirements.txt") if (wheelhouse / n).is_file()), None)
         cmd.extend(["--override", str(req_file), "-r", str(req_file)] if req_file is not None else [str(p) for p in sorted(wheelhouse.glob("*.whl"))])
@@ -404,10 +449,29 @@ def update_runtime(
             return discovered
         channel = discovered
         target = _normalize_components(channel.get("components"))
-        chosen = selection or RuntimeSelection.from_pins(target, plugin_version=str(channel.get("product_version") or "") or None, source_sha256=str((channel.get("checksums") or {}).get(CHANNEL_MANIFEST_NAME) or "") or None)
+        if selection is not None:
+            merged_pins = dict(target)
+            for name, meta in selection.components.items():
+                merged_pins[name] = {**target.get(name, {}), **meta}
+            chosen = RuntimeSelection.from_pins(
+                merged_pins,
+                plugin_version=selection.plugin_version or str(channel.get("product_version") or "") or None,
+                source_sha256=selection.source_sha256 or str((channel.get("checksums") or {}).get(CHANNEL_MANIFEST_NAME) or "") or None,
+            )
+        else:
+            chosen = RuntimeSelection.from_pins(
+                target,
+                plugin_version=str(channel.get("product_version") or "") or None,
+                source_sha256=str((channel.get("checksums") or {}).get(CHANNEL_MANIFEST_NAME) or "") or None,
+            )
         cfg = read_json_safe(profile.config_path)
         cfg_python = cfg.get("python") if isinstance(cfg, dict) else None
         if _same_components(_current_components(cfg if isinstance(cfg, dict) else None), chosen.components) and isinstance(cfg_python, str) and Path(cfg_python).is_file():
+            if has_knowledge_package(cfg_python):
+                eng_raw = cfg.get("engine_config") if isinstance(cfg, dict) else None
+                dom_map = cfg.get("domain_configs") if isinstance(cfg, dict) else None
+                if not (isinstance(eng_raw, str) and Path(eng_raw).is_file() and isinstance(dom_map, Mapping) and len(dom_map) >= 9):
+                    ensure_knowledge_binding(profile, python_executable=cfg_python)
             _clear_backoff(profile)
             return {"status": "up_to_date", "reportable": False, "components": dict(chosen.components), "python": cfg_python, "checked_at": current}
         wheelhouse = stage_wheelhouse(profile, channel=channel, selection=chosen, offline=offline, env=env, timeout=timeout, deadline=deadline)

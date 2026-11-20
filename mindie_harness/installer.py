@@ -164,7 +164,7 @@ def _configured(profile: ProfileRef, plugin_root: str | Path | None, channel_bas
         if channel_base_url or (not offline and _network_available()):
             return update_runtime(profile, channel_base_url=channel_base_url, offline=offline, env=env)
         root = Path(plugin_root) if plugin_root else profile.plugin_root
-        if (root / "pyproject.toml").is_file() or (root / "wheelhouse").is_dir():
+        if (root / "pyproject.toml").is_file() or (root / "runtime-requirements.txt").is_file() or (root / "wheelhouse").is_dir():
             from .api import activate_runtime, prepare_runtime  # type: ignore[import-not-found]
 
             prepared = prepare_runtime(profile)

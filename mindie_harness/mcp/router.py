@@ -1,28 +1,28 @@
 """Silent default-on & `P2.7`/`P2.8` zero-binding MCP router across all MindIE surfaces.
 
 [Role]
-Validates MCP `tools/call` envelopes, rejects forged-identity arguments, exposes
-all registered tools across `remote`, `tools`, `components`, `knowledge`, and `all`
+Validates MCP `tools/call` envelopes, rejects forged-identity arguments while
+honoring schema-declared job handles (`remote_*` `session_id`), exposes all
+registered tools across `remote`, `tools`, `components`, `knowledge`, and `all`
 with ZERO pre-call session-binding or manual admission gates (`P2.7` / `P2.8`),
 and preserves Receipt Honesty when local accounting fails after primary success.
 
 [Invariants]
 - Never mutates global `os.environ` or `os.chdir()`; every call builds an isolated
   `RequestContext` (`session_id`, `cwd`, `env`, `deadline`, `cancel`).
-- Read-only / status / cancel tools (`is_readonly_or_control_tool`, including
-  `mindie_doctor`, `mindie_status`, `knowledge_query`, `knowledge_explain`, and the
-  case-accurate native read/poll/control names across all 7 host harnesses) have ZERO
-  artificial concurrency cap (`AD-09` fixed) and zero replay-ledger lock contention.
-- `remote_auth` is action-aware: `{"action": "status"}` is read-only, while `setup`
-  and `forget` remain mutation-accounted so SSH state changes get receipts.
-- All tools uniformly strip legacy optional `_mindie_bind_id`, `request_nonce`, and
-  `context_file` from `inputSchema["required"]` and incoming arguments, falling back
-  to `{host}-conn-{connection_id[:12]}` when host session metadata is absent.
+- Read-only / status / cancel tools (`is_readonly_tool_call`) skip `BindStore.claim_bind`
+  (`BEGIN IMMEDIATE`) unless an explicit `_meta.bind_id` is supplied, eliminating
+  SQLite writer contention on `mcp-binds.sqlite3` during concurrent reads/polls.
+- Action-multiplexed tools (`remote_auth`, `remote_manage_task`, `remote_job_status`,
+  `remote_write_stdin`, `npu_top`, `debugger`) classify mutations vs reads per call.
+- Strips legacy optional `_mindie_bind_id`, `request_nonce`, and `context_file`
+  from `inputSchema["required"]` and incoming arguments, falling back to
+  `{host}-conn-{connection_id[:12]}` when host session metadata is absent.
 
 [Timeouts & Locks]
 - Enforces Principle 10 per-tool budgets (`remote_bash` `660s = 600s + 60s`,
-  `remote_write_stdin` `360s = 300s + 60s`, `mindie_doctor` `10s/15s + grace`,
-  `components` `130s..660s`, `knowledge` `45s = 35s + 10s` / `120s = 110s + 10s`).
+  `remote_write_stdin` `360s = 300s + 60s`, `mindie_doctor` `10s/20s + 5s`,
+  `components` `130s..660s`, `knowledge` `45s = 35s + 10s` / `510s = 450s + 60s`).
 
 [Side-Effect Policy]
 - Dispatches validated tool invocations through the bound `HostAdapter` or handler map
@@ -42,28 +42,20 @@ from typing import Any, Callable, Mapping
 import uuid
 
 from ..paths import HarnessError, ProfileRef
-from ..process.supervisor import Deadline, ProcessCancelledError
+from ..process.supervisor import Deadline, OutputLimitError, ProcessCancelledError
 from ..rsi import rsi_explore
 from .doctor import DOCTOR_TOOL_NAME, doctor_tool_definition, run_doctor_tool
 from .receipts import BindStore, RemoteReceipts, apply_receipt_honesty
 
 FORGED_IDENTITY_KEYS: frozenset[str] = frozenset(
-    {
-        "session",
-        "session_id",
-        "conversation_id",
-        "mindie_activation",
-        "token",
-        "project_root",
-    }
+    {"session", "session_id", "conversation_id", "mindie_activation", "token", "project_root"}
 )
-CORRELATION_STRIP_KEYS: frozenset[str] = frozenset(
-    {"_mindie_bind_id", "request_nonce", "context_file"}
-)
+CORRELATION_STRIP_KEYS: frozenset[str] = frozenset({"_mindie_bind_id", "request_nonce", "context_file"})
 
 REMOTE_NATIVE_MAX_WAIT_MS: dict[str, int] = {
     "remote_bash": 600_000,
     "remote_Bash": 600_000,
+    "remote_Shell": 600_000,
     "remote_run_command": 600_000,
     "remote_write_stdin": 300_000,
     "remote_job_stdin": 300_000,
@@ -78,6 +70,11 @@ DOCTOR_LOCAL_OUTER_SECONDS = 10.0
 DOCTOR_PROBE_OUTER_SECONDS = 20.0
 DOCTOR_CLEANUP_GRACE_SECONDS = 5.0
 
+KNOWLEDGE_HEAVY_INNER_SECONDS = 450.0
+KNOWLEDGE_HEAVY_GRACE_SECONDS = 60.0
+KNOWLEDGE_READ_INNER_SECONDS = 35.0
+KNOWLEDGE_READ_GRACE_SECONDS = 10.0
+
 READONLY_TOOL_PREFIXES: tuple[str, ...] = (
     "remote_read",
     "remote_cat",
@@ -89,9 +86,12 @@ READONLY_TOOL_PREFIXES: tuple[str, ...] = (
     "remote_ls",
     "remote_job_status",
     "remote_job_output",
+    "remote_job_tail",
     "remote_job_poll",
     "remote_job_list",
     "remote_job_cancel",
+    "remote_job_stop",
+    "remote_job_kill",
     "remote_cancel",
     "remote_ping",
     "remote_hosts",
@@ -104,19 +104,18 @@ READONLY_TOOL_PREFIXES: tuple[str, ...] = (
     "remote_TaskStop",
     "remote_ViewImage",
     "remote_ReadMediaFile",
-    # Antigravity / OpenCode native read, image, and probe tools (`remote_manage_task`
-    # is classified by `Action` in `is_readonly_tool_call` so `send_input` stays receipted).
+    # Antigravity / OpenCode native read, image, and probe tools.
     "remote_view_image",
     "remote_probe",
-    # Antigravity native read-only file and search tools.
     "remote_read_file",
     "remote_find_by_name",
     "remote_grep_search",
     "remote_list_dir",
-    # Diagnostics and harness status/control tools stay on the lock-free lane.
+    # Diagnostics, simulator, and harness status/control tools stay on the lock-free lane.
     "mindie_status",
     "mindie_doctor",
     "mindie_interrupt",
+    "sim",
     "npu_top",
     "diagnostics_status",
     "debugger_triage",
@@ -126,6 +125,19 @@ READONLY_TOOL_PREFIXES: tuple[str, ...] = (
 
 REMOTE_AUTH_READONLY_ACTIONS: frozenset[str] = frozenset({"status"})
 REMOTE_MANAGE_TASK_READONLY_ACTIONS: frozenset[str] = frozenset({"list", "status", "kill", "stop"})
+NPU_TOP_MUTATION_SUBCOMMANDS: frozenset[str] = frozenset({"inventory", "diagnostics"})
+DEBUGGER_READONLY_SUBCOMMANDS: frozenset[str] = frozenset(
+    {"decode-code", "triage", "--version", "-h", "--help"}
+)
+PROFILER_READONLY_SUBCOMMANDS: frozenset[str] = frozenset(
+    {"analyze", "compare", "inspect", "doctor", "--version", "version", "-h", "--help"}
+)
+EXPERIMENT_LEDGER_READONLY_SUBCOMMANDS: frozenset[str] = frozenset(
+    {"fingerprint", "summary", "list", "show", "--version", "-h", "--help"}
+)
+RSI_LOOP_READONLY_SUBCOMMANDS: frozenset[str] = frozenset(
+    {"status", "inspect", "--version", "-h", "--help"}
+)
 
 
 @dataclass(frozen=True)
@@ -169,6 +181,57 @@ def is_readonly_tool_call(
         raw_action = args.get("Action") if "Action" in args else args.get("action")
         action = str(raw_action or "").strip().lower()
         return action in REMOTE_MANAGE_TASK_READONLY_ACTIONS
+    if clean == "remote_job_status":
+        raw_action = args.get("Action") if "Action" in args else args.get("action")
+        if str(raw_action or "").strip().lower() == "send_input" or "chars" in args or "input" in args:
+            return False
+        return True
+    if clean in {"remote_write_stdin", "remote_job_stdin"}:
+        chars = args.get("chars")
+        has_chars = isinstance(chars, str) and len(chars) > 0
+        return (not has_chars) and (args.get("eof") is not True)
+    if clean == "npu_top":
+        argv = args.get("argv")
+        if isinstance(argv, (list, tuple)) and argv:
+            subcmds = [str(a).strip().lower() for a in argv if isinstance(a, str) and not str(a).strip().startswith("-")]
+            if subcmds and subcmds[0] in NPU_TOP_MUTATION_SUBCOMMANDS:
+                return False
+        return True
+    if clean == "debugger":
+        argv = args.get("argv")
+        if isinstance(argv, (list, tuple)) and argv:
+            subcmds = [str(a).strip().lower() for a in argv if isinstance(a, str) and not str(a).strip().startswith("-")]
+            return bool(subcmds and subcmds[0] in DEBUGGER_READONLY_SUBCOMMANDS)
+        return False
+    if clean == "profiler":
+        argv = args.get("argv")
+        if isinstance(argv, (list, tuple)) and argv:
+            subcmds = [str(a).strip().lower() for a in argv if isinstance(a, str) and not str(a).strip().startswith("-")]
+            return bool(subcmds and subcmds[0] in PROFILER_READONLY_SUBCOMMANDS)
+        return False
+    if clean == "coordinator":
+        argv = [str(x).strip().lower() for x in (args.get("argv") or ()) if isinstance(x, (str, int))]
+        if not argv:
+            return False
+        if argv[0] in {"--version", "-h", "--help"}:
+            return True
+        if argv[0] == "task-server" and "--describe" in argv:
+            return True
+        if "--action" in argv:
+            idx = argv.index("--action")
+            if idx + 1 < len(argv) and argv[idx + 1] in {"list", "status", "inspect"}:
+                return True
+        return False
+    if clean == "experiment_ledger":
+        argv = args.get("argv")
+        if isinstance(argv, (list, tuple)) and argv:
+            return str(argv[0]).strip().lower() in EXPERIMENT_LEDGER_READONLY_SUBCOMMANDS
+        return False
+    if clean == "rsi_loop":
+        argv = args.get("argv")
+        if isinstance(argv, (list, tuple)) and argv:
+            return str(argv[0]).strip().lower() in RSI_LOOP_READONLY_SUBCOMMANDS
+        return False
     return is_readonly_or_control_tool(clean, tool_schema)
 
 
@@ -182,8 +245,6 @@ def compute_tool_deadline(
     """Compute Principle-10 outer `Deadline` (`outer >= inner + cleanup_grace`)."""
     args = arguments or {}
 
-    # Local diagnostics doctor: 5s inner local budget, +5s for an optional remote probe,
-    # plus cleanup grace. Read-only and lock-free, but still bounded end-to-end.
     if tool_name == DOCTOR_TOOL_NAME:
         probe_remote = args.get("probe_remote") is True
         inner_sec = DOCTOR_PROBE_OUTER_SECONDS if probe_remote else DOCTOR_LOCAL_OUTER_SECONDS
@@ -195,10 +256,27 @@ def compute_tool_deadline(
     if surface == "remote" or tool_name.startswith("remote_"):
         native_ms = float(REMOTE_NATIVE_MAX_WAIT_MS.get(tool_name, 0))
         caller_ms = 0.0
-        for k in ("yield_time_ms", "timeout_ms", "WaitMsBeforeAsync", "timeout"):
+        for k in ("yield_time_ms", "timeout_ms", "timeoutMs", "WaitMsBeforeAsync"):
             val = args.get(k)
             if not isinstance(val, bool) and isinstance(val, (int, float)) and math.isfinite(val) and val > 0:
                 caller_ms = max(caller_ms, float(val))
+        raw_timeout = args.get("timeout")
+        if (
+            not isinstance(raw_timeout, bool)
+            and isinstance(raw_timeout, (int, float))
+            and math.isfinite(raw_timeout)
+            and raw_timeout > 0
+        ):
+            # Kimi Shell/Bash habits pass `timeout` in seconds (<= 600), whereas
+            # canonical `remote_bash` passes milliseconds when `timeout_ms` is aliased.
+            if (
+                tool_name in {"remote_Shell", "remote_Bash"}
+                and "timeout_ms" not in args
+                and float(raw_timeout) <= 600.0
+            ):
+                caller_ms = max(caller_ms, float(raw_timeout) * 1000.0)
+            else:
+                caller_ms = max(caller_ms, float(raw_timeout))
         inner_sec = max(native_ms / 1000.0, caller_ms / 1000.0)
         outer = max(REMOTE_MIN_BUDGET_SECONDS, inner_sec + REMOTE_GRACE_SECONDS)
         if explicit_timeout is not None and explicit_timeout > outer:
@@ -206,8 +284,9 @@ def compute_tool_deadline(
         return Deadline.from_timeout(outer, cleanup_grace=REMOTE_GRACE_SECONDS)
 
     if surface == "knowledge" or tool_name.startswith("knowledge_"):
-        inner_sec = 110.0 if tool_name in {"knowledge_sync", "knowledge_distill"} else 35.0
-        grace = 10.0
+        is_heavy = tool_name in {"knowledge_sync", "knowledge_distill"}
+        inner_sec = KNOWLEDGE_HEAVY_INNER_SECONDS if is_heavy else KNOWLEDGE_READ_INNER_SECONDS
+        grace = KNOWLEDGE_HEAVY_GRACE_SECONDS if is_heavy else KNOWLEDGE_READ_GRACE_SECONDS
         required = inner_sec + grace
         if explicit_timeout is not None:
             if float(explicit_timeout) < required:
@@ -220,7 +299,6 @@ def compute_tool_deadline(
             return Deadline.from_timeout(float(explicit_timeout), cleanup_grace=grace)
         return Deadline.from_timeout(required, cleanup_grace=grace)
 
-    # Deterministic component tools (coordinator, debugger, profiler, sim, npu-top, diagnostics)
     caller_ms = args.get("timeout_ms")
     caller_sec = (
         float(caller_ms) / 1000.0
@@ -289,6 +367,29 @@ def _normalize_tool_def(tool: Mapping[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _matches_json_type(value: Any, spec: Mapping[str, Any]) -> bool:
+    declared = spec.get("type")
+    if isinstance(declared, str):
+        allowed_types: tuple[str, ...] = (declared,)
+    elif isinstance(declared, (list, tuple)):
+        allowed_types = tuple(str(x) for x in declared)
+    else:
+        for union_key in ("anyOf", "oneOf"):
+            variants = spec.get(union_key)
+            if isinstance(variants, (list, tuple)):
+                return any(isinstance(v, Mapping) and _matches_json_type(value, v) for v in variants)
+        return not isinstance(value, bool) and isinstance(value, (int, str))
+
+    for kind in allowed_types:
+        if kind == "integer" and isinstance(value, int) and not isinstance(value, bool):
+            return True
+        if kind == "number" and isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            return True
+        if kind == "string" and isinstance(value, str) and bool(value.strip()):
+            return True
+    return False
+
+
 def _format_mcp_error(exc: BaseException, *, handler_started: bool = False) -> dict[str, Any]:
     if isinstance(exc, HarnessError):
         info = exc.to_dict()
@@ -297,37 +398,28 @@ def _format_mcp_error(exc: BaseException, *, handler_started: bool = False) -> d
             "isError": True,
             "structuredContent": info,
         }
-    if isinstance(exc, TimeoutError):
-        if handler_started:
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "MindIE request deadline exceeded; external outcome may be unconfirmed. Inspect state before retrying.",
-                    }
-                ],
-                "isError": True,
-                "structuredContent": {
-                    "stage": "timeout",
-                    "reason": "helper_timeout",
-                    "submission_state": "uncertain",
-                    "retryable": False,
-                },
-            }
+    if isinstance(exc, OutputLimitError):
         return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "MindIE request timed out before tool dispatch; operation was not sent.",
-                }
-            ],
+            "content": [{"type": "text", "text": f"{exc}. Inspect state before retrying."}],
             "isError": True,
             "structuredContent": {
-                "stage": "timeout",
-                "reason": "helper_timeout",
-                "submission_state": "not_sent",
+                "stage": "output_limit",
+                "reason": "output_limit_exceeded",
+                "submission_state": "uncertain" if handler_started else "not_sent",
                 "retryable": False,
             },
+        }
+    if isinstance(exc, TimeoutError):
+        state = "uncertain" if handler_started else "not_sent"
+        msg = (
+            "MindIE request deadline exceeded; external outcome may be unconfirmed. Inspect state before retrying."
+            if handler_started
+            else "MindIE request timed out before tool dispatch; operation was not sent."
+        )
+        return {
+            "content": [{"type": "text", "text": msg}],
+            "isError": True,
+            "structuredContent": {"stage": "timeout", "reason": "helper_timeout", "submission_state": state, "retryable": False},
         }
     return {
         "content": [{"type": "text", "text": f"MindIE tool execution failed ({type(exc).__name__})."}],
@@ -336,6 +428,7 @@ def _format_mcp_error(exc: BaseException, *, handler_started: bool = False) -> d
             "stage": "dispatch",
             "reason": "internal_error",
             "error_type": type(exc).__name__,
+            "submission_state": "uncertain" if handler_started else "not_sent",
             "retryable": False,
         },
     }
@@ -408,7 +501,21 @@ class MCPRouter:
                 reason="input_not_object",
                 reportable=False,
             )
-        forged = FORGED_IDENTITY_KEYS.intersection(raw_args.keys())
+        tool_def = self._tool_map.get(name)
+        schema = tool_def.get("inputSchema") if isinstance(tool_def, Mapping) else None
+        props = schema.get("properties") if isinstance(schema, Mapping) else None
+
+        allow_job_session_id = (
+            name.startswith("remote_")
+            and isinstance(props, Mapping)
+            and "session_id" in props
+        )
+        forbidden_keys = (
+            FORGED_IDENTITY_KEYS - {"session_id"}
+            if allow_job_session_id
+            else FORGED_IDENTITY_KEYS
+        )
+        forged = forbidden_keys.intersection(raw_args.keys())
         if forged:
             raise HarnessError(
                 "Model-supplied identity override arguments are forbidden",
@@ -416,11 +523,6 @@ class MCPRouter:
                 reason="forged_identity_argument",
                 reportable=False,
             )
-        args = dict(raw_args)
-        for key in CORRELATION_STRIP_KEYS:
-            args.pop(key, None)
-
-        tool_def = self._tool_map.get(name)
         if tool_def is None:
             raise HarnessError(
                 f"Unknown MindIE MCP tool: {name!r}",
@@ -428,9 +530,23 @@ class MCPRouter:
                 reason="unknown_operation",
                 reportable=False,
             )
-        schema = tool_def.get("inputSchema")
+
+        args = dict(raw_args)
+        for key in CORRELATION_STRIP_KEYS:
+            args.pop(key, None)
+
+        if allow_job_session_id and "session_id" in args and isinstance(props, Mapping):
+            spec = props.get("session_id")
+            if isinstance(spec, Mapping) and not _matches_json_type(args["session_id"], spec):
+                raise HarnessError(
+                    f"Invalid `session_id` handle type for {name}",
+                    stage="tool_schema",
+                    reason="invalid_argument_type",
+                    reportable=False,
+                    details={"field": "session_id"},
+                )
+
         if isinstance(schema, Mapping):
-            props = schema.get("properties")
             req = list(schema.get("required") or ())
             missing = [r for r in req if r not in args]
             if missing:
@@ -490,6 +606,7 @@ class MCPRouter:
             args = self._validate_and_clean_args(name, params.get("arguments"))
             deadline = compute_tool_deadline(self.surface, name, args, explicit_timeout=timeout)
             args_digest = hashlib.sha256(json.dumps(args, sort_keys=True).encode("utf-8")).hexdigest()
+            readonly = is_readonly_tool_call(name, args, self._tool_map.get(name))
 
             extracted_session = (
                 self._session_extractor(request, self._base_env)
@@ -500,7 +617,9 @@ class MCPRouter:
 
             bound_cwd: Path | None = None
             bind_row: dict[str, Any] | None = None
-            if effective_bind_id is not None or extracted_session is not None:
+            # Read-only / control calls skip BindStore writer locks unless an explicit
+            # `_meta.bind_id` was supplied by the host hook.
+            if effective_bind_id is not None or (not readonly and extracted_session is not None):
                 try:
                     bind_row = self.binds.claim_bind(
                         bind_id=effective_bind_id,
@@ -520,10 +639,8 @@ class MCPRouter:
                 if bind_row.get("cwd"):
                     bound_cwd = Path(bind_row["cwd"])
 
-            # Iron Rule 5 (P2.7 / P2.8): zero pre-call session binding across all surfaces!
             session_id = extracted_session or f"{self.profile.host}-conn-{self.connection_id[:12]}"
 
-            readonly = is_readonly_tool_call(name, args, self._tool_map.get(name))
             if not readonly:
                 req_hash = hashlib.sha256(json.dumps(req_id, sort_keys=True).encode("utf-8")).hexdigest()[:24]
                 call_id = f"{self.connection_id}:{req_hash}"
@@ -586,6 +703,7 @@ class MCPRouter:
                     doctor_args["cwd"] = str(ctx.cwd)
                 result = run_doctor_tool(
                     doctor_args,
+                    profile=self.profile,
                     deadline=ctx.deadline,
                     cancel=ctx.cancel,
                     env=ctx.env,
@@ -606,13 +724,16 @@ class MCPRouter:
                 raise HarnessError("Tool handler returned non-object response", stage="dispatch", reason="invalid_response")
 
             structured = result.get("structuredContent")
+            is_err = result.get("isError") is True
             uncertain = isinstance(structured, Mapping) and (
                 structured.get("submission_state") == "uncertain"
+                or (is_err and structured.get("submission_state") == "sent")
                 or structured.get("status") == "submission_uncertain"
+                or structured.get("unknown") is True
             )
             if uncertain:
                 outcome_label = "unknown"
-            elif result.get("isError") is True:
+            elif is_err:
                 outcome_label = "failed"
             else:
                 outcome_label = "succeeded"
@@ -624,7 +745,11 @@ class MCPRouter:
             result = _format_mcp_error(exc, handler_started=handler_started)
             return result
         except Exception as exc:
-            outcome_label = "unknown" if (isinstance(exc, TimeoutError) and handler_started) else "failed"
+            outcome_label = (
+                "unknown"
+                if (isinstance(exc, (TimeoutError, OutputLimitError)) and handler_started)
+                else "failed"
+            )
             result = _format_mcp_error(exc, handler_started=handler_started)
             return result
         finally:

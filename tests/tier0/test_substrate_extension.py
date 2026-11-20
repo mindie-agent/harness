@@ -203,12 +203,12 @@ def test_remote_mcp_envelope_and_error_outcome(tmp_path: Path, monkeypatch: pyte
     ok = dispatch_remote_tool(_context(), {"cmd": "echo"}, profile, "codex")
     assert ok["isError"] is False
     assert isinstance(ok["content"], list) and ok["content"][0]["type"] == "text"
-    assert ok["structuredContent"]["result"]["outcome"] == "success"
+    assert ok["structuredContent"]["outcome"] == "success"
 
     monkeypatch.setattr(tools, "call_tool", lambda name, args, profile=None: {"text": "failed", "result": {"outcome": "failed", "error": "boom"}})
     bad = dispatch_remote_tool(_context(), {}, profile, "codex")
     assert bad["isError"] is True
-    assert bad["structuredContent"]["result"]["error"] == "boom"
+    assert bad["structuredContent"]["error"] == "boom"
 
     def explode(name, args, profile=None):
         raise RuntimeError("ssh exploded")
@@ -310,7 +310,7 @@ def test_component_rebind_preserves_custom_wrappers(tmp_path: Path) -> None:
     assert rebind_native_plugin_if_needed(profile) is not None
     cfg = json.loads(profile.config_path.read_text(encoding="utf-8"))
     assert cfg["component_commands"]["profiler"] == custom
-    assert cfg["component_commands"]["sim"] == [sys.executable, "-I", "-X", "utf8", "-m", "mindie_sim"]
+    assert cfg["component_commands"]["sim"] == [sys.executable, "-I", "-X", "utf8", "-m", "mindie_sim.cli"]
     assert cfg["component_commands"]["coordinator"] == [sys.executable, "-I", "-X", "utf8", "-m", "mindie_coordinator.cli"]
     assert cfg["component_commands"]["custom"] == ["keep"]
 
@@ -323,7 +323,7 @@ def test_component_rebind_preserves_custom_wrappers(tmp_path: Path) -> None:
     }
     rebind_component_commands(wheelhouse_cfg, "/new/python")
     assert wheelhouse_cfg["component_commands"]["profiler"] == custom
-    assert wheelhouse_cfg["component_commands"]["sim"] == ["/new/python", "-I", "-X", "utf8", "-m", "mindie_sim"]
+    assert wheelhouse_cfg["component_commands"]["sim"] == ["/new/python", "-I", "-X", "utf8", "-m", "mindie_sim.cli"]
     assert wheelhouse_cfg["component_commands"]["debugger"] == ["/new/python", "-I", "-X", "utf8", "-m", "mindie_debugger.cli"]
 
 
@@ -460,7 +460,7 @@ def test_component_default_command_and_spool_cap(tmp_path: Path, monkeypatch: py
     result = run_component_tool(_context("sim"), "sim", {}, profile)
     assert result["isError"] is False
     assert captured["max_output_bytes"] == 16 * 1024 * 1024
-    assert captured["argv"] == (sys.executable, "-I", "-X", "utf8", "-m", "mindie_sim")
+    assert captured["argv"] == (sys.executable, "-I", "-X", "utf8", "-m", "mindie_sim.cli")
 
 
 def test_product_channel_normalization_bundle_members_and_override_builder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -44,10 +44,10 @@ from ..atomic import (
     sweep_trash_directories,
 )
 from ..locks import FileLock, LockTimeoutError
-from ..paths import HarnessError, ProfileRef, resolve_host_python, venv_python_path
+from ..paths import HarnessError, ProfileRef, resolve_base_cpython, venv_python_path
 from ..process.posix import which_posix_binary
 from ..process.supervisor import Deadline, ProcessExecutionError, ProcessSpec, coerce_deadline, run_owned
-from ..process.win32 import probe_current_job, verify_gui_subsystem
+from ..process.win32 import probe_current_job, repair_venv_pythonw_if_needed, verify_gui_subsystem
 from .registry import RuntimeSelection
 
 MIN_BUILD_FREE_BYTES: int = int(2.5 * (1024 ** 3))  # 2,684,354,560 bytes (2.5 GiB)
@@ -135,7 +135,11 @@ def _is_receipt_valid(gen_dir: Path) -> tuple[bool, Path | None, dict[str, Any]]
         try:
             verify_gui_subsystem(pyw)
         except HarnessError:
-            return False, None, {}
+            repair_venv_pythonw_if_needed(gen_dir / ".venv")
+            try:
+                verify_gui_subsystem(pyw)
+            except HarnessError:
+                return False, None, {}
     return True, py_path, receipt
 
 
@@ -256,6 +260,14 @@ def _default_uv_builder(
     )
 
 
+def _venv_has_selftest(venv_dir: Path) -> bool:
+    sites = [venv_dir / "Lib" / "site-packages"]
+    lib_dir = venv_dir / "lib"
+    if lib_dir.is_dir():
+        sites.extend(lib_dir.glob("python*/site-packages"))
+    return any((s / "mindie_harness" / "selftest.py").is_file() for s in sites if s.is_dir())
+
+
 def _retire_failed_candidate(gen_dir: Path) -> None:
     try:
         stage_retire_directory(gen_dir)
@@ -332,7 +344,7 @@ def prepare_candidate_runtime(
         atomic_write_text(sentinel, f"{os.getpid()}\n")
 
         build_env = _adaptive_build_env(profile, gen_dir)
-        base_py = Path(python) if python is not None else resolve_host_python(build_env)
+        base_py = resolve_base_cpython(python, build_env)
 
         try:
             if builder_fn is not None:
@@ -354,6 +366,7 @@ def prepare_candidate_runtime(
                     reportable=False,
                 )
             if os.name == "nt":
+                repair_venv_pythonw_if_needed(venv_dir, base_py)
                 verify_gui_subsystem(built_py.with_name("pythonw.exe"))
 
             eff_smoke = tuple(smoke_imports) if smoke_imports or builder_fn is not None else ("mindie_harness",)
@@ -373,7 +386,47 @@ def prepare_candidate_runtime(
                     reason="candidate_probe_failed",
                     submission_state="acknowledged",
                     retryable=True,
+                    reportable=False,
                 )
+
+            if _venv_has_selftest(venv_dir):
+                selftest_budget = min(45.0, max(10.0, resolved_deadline.remaining()))
+                st_out = run_owned(
+                    ProcessSpec(
+                        argv=(
+                            str(built_py),
+                            "-I",
+                            "-X",
+                            "utf8",
+                            "-m",
+                            "mindie_harness.cli",
+                            "--host",
+                            profile.host,
+                            "selftest",
+                            "--mode",
+                            "candidate",
+                            "--json",
+                        ),
+                        env=build_env,
+                        role="background_maintenance",
+                        allowed_returncodes=None,
+                    ),
+                    deadline=Deadline.from_timeout(selftest_budget),
+                )
+                try:
+                    st_doc = json.loads((st_out.stdout or "").strip().splitlines()[-1]) if (st_out.stdout or "").strip() else {}
+                except ValueError:
+                    st_doc = {}
+                if st_out.returncode != 0 or st_doc.get("status") != "passed":
+                    raise HarnessError(
+                        f"Candidate selftest (--mode candidate) failed (rc={st_out.returncode})",
+                        stage="candidate_probe",
+                        reason="candidate_probe_failed",
+                        submission_state="acknowledged",
+                        retryable=True,
+                        reportable=False,
+                        details={"selftest": st_doc},
+                    )
 
             receipt_payload = {
                 "schema": CANDIDATE_RECEIPT_SCHEMA,
