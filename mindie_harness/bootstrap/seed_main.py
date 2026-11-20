@@ -29,23 +29,13 @@ therefore importing ZERO sibling modules outside the Python standard library.
 """
 from __future__ import annotations
 
-import argparse
-import hashlib
-import json
-import os
+from contextlib import contextmanager
+import argparse, hashlib, json, os, shutil, signal, struct, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request
 from pathlib import Path
-import shutil
-import signal
-import struct
-import subprocess
-import sys
-import tempfile
-import threading
-import time
 from typing import Any
 
 SEED_LOCK_SCHEMA = "mindie-harness-seed/1"
-SEED_VERSION = "0.1.6"
+SEED_VERSION = "0.1.7"
 MIN_FREE_BYTES = int(2.5 * (1024 ** 3))
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _WIN_EXTS = (".exe", ".cmd", ".bat", ".com", ".ps1")
@@ -573,21 +563,49 @@ def _run_owned_seed_cmd(cmd: list[str], *, env: dict[str, str], timeout: float) 
         raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=err)
 
 
-def _provision_cold(host: str, plugin_root: Path, cfg_path: Path, *, smoke_module: str = "mindie_harness") -> Path:
-    d_home = _seed_data_home()
-    d_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock_path = d_home / f".prepare-{host}.lock"
+@contextmanager
+def _seed_lock(lock_path: Path, *, timeout: float = 300.0):
+    deadline = time.monotonic() + timeout
     with lock_path.open("a+b") as lf:
         if os.name == "nt":
             import msvcrt
-
-            lf.seek(0); lf.write(b"0"); lf.flush(); lf.seek(0)
-            msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+            lf.seek(0); lf.write(b"0"); lf.flush()
+            while True:
+                try: lf.seek(0); msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1); break
+                except OSError:
+                    if time.monotonic() >= deadline: raise TimeoutError(f"Timed out waiting for {lock_path}") from None
+                    time.sleep(0.2)
+            try: yield
+            finally: lf.seek(0); msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
+            while True:
+                try: fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB); break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline: raise TimeoutError(f"Timed out waiting for {lock_path}") from None
+                    time.sleep(0.2)
+            try: yield
+            finally: fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
 
+def _stage_local_channel_bundle(dest: Path) -> Path | None:
+    raw = (os.environ.get("MINDIE_CHANNEL_BASE_URL") or "").strip()
+    if not raw or raw.lower().startswith(("http://", "https://")):
+        return None
+    src = Path(urllib.request.url2pathname(urllib.parse.urlparse(raw).path)) if raw.lower().startswith("file://") else Path(raw)
+    tar_p = src / "mindie-wheels-bundle.tar.gz"
+    if not tar_p.is_file():
+        return None
+    dest.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tarfile.open(tar_p, "r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    return dest if (dest / "requirements.txt").is_file() else None
+
+
+def _provision_cold(host: str, plugin_root: Path, cfg_path: Path, *, smoke_module: str = "mindie_harness") -> Path:
+    d_home = _seed_data_home()
+    d_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with _seed_lock(d_home / f".prepare-{host}.lock"):
         gen_dir = d_home / "runtimes" / host / f"seed-{sys.platform}"
         venv_dir = gen_dir / ".venv"
         venv_py = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -619,8 +637,15 @@ def _provision_cold(host: str, plugin_root: Path, cfg_path: Path, *, smoke_modul
             raise RuntimeError(f"Cannot provision runtime from {plugin_root}: missing pyproject.toml, runtime-requirements.txt, or wheelhouse")
 
         gen_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        bundle_wh = gen_dir / "_bundle_wh"
         try:
-            if pyproject.is_file():
+            staged_wh = _stage_local_channel_bundle(bundle_wh)
+            if staged_wh is not None:
+                _run_owned_seed_cmd([uv_bin, "venv", "--python", base_py, str(venv_dir)], env=env, timeout=120.0)
+                req_b = staged_wh / "requirements.txt"
+                _run_owned_seed_cmd([uv_bin, "--native-tls", "pip", "install", "--python", str(venv_py), "--offline", "--no-index", "--find-links", str(staged_wh), "--override", str(req_b), "-r", str(req_b)], env=env, timeout=240.0)
+                shutil.rmtree(bundle_wh, ignore_errors=True)
+            elif pyproject.is_file():
                 cmd = [uv_bin, "--native-tls", "sync", "--no-editable", "--no-dev", "--python", base_py, "--project", str(plugin_root)]
                 if (plugin_root / "uv.lock").is_file():
                     cmd.append("--locked")
@@ -712,68 +737,39 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--emit-template")
     parser.add_argument("--verify-lock", nargs=2, metavar=("PYZ", "LOCK"))
     parser.add_argument("--host")
-    parser.add_argument("--plugin-root")
-    parser.add_argument("--config")
-    parser.add_argument("--cli-module", default="mindie_harness.cli")
+    parser.add_argument("--plugin-root"); parser.add_argument("--config"); parser.add_argument("--cli-module", default="mindie_harness.cli")
     known, rest = parser.parse_known_args(argv)
-
-    if known.version:
-        sys.stdout.write(f"mindie-harness-seed {SEED_VERSION}\n")
-        return 0
-    if known.emit_template:
-        sys.stdout.write(render_plugin_bootstrap_template(known.emit_template, cli_module=known.cli_module))
-        return 0
-    if known.verify_lock:
-        sys.stdout.write(json.dumps(verify_seed_lock(known.verify_lock[0], known.verify_lock[1]), sort_keys=True) + "\n")
-        return 0
+    if known.version: sys.stdout.write(f"mindie-harness-seed {SEED_VERSION}\n"); return 0
+    if known.emit_template: sys.stdout.write(render_plugin_bootstrap_template(known.emit_template, cli_module=known.cli_module)); return 0
+    if known.verify_lock: sys.stdout.write(json.dumps(verify_seed_lock(known.verify_lock[0], known.verify_lock[1]), sort_keys=True) + "\n"); return 0
     if not known.host or not known.plugin_root or not known.config:
-        sys.stderr.write("Usage: mindie-harness-seed.pyz --host <host> --plugin-root <dir> --config <path> <args...>\n")
-        return 2
+        sys.stderr.write("Usage: mindie-harness-seed.pyz --host <host> --plugin-root <dir> --config <path> <args...>\n"); return 2
 
     cfg_path = Path(known.config).resolve()
     hook_op = rest[1].lower().replace("_", "-") if len(rest) >= 2 and rest[0] == "hook" else ""
     stdin_buf: bytes | None = None
     has_active_py = _config_has_usable_python(_read_seed_json(cfg_path))
     if hook_op in {"pre-invocation", "user-prompt-submit"} and not has_active_py:
-        sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush()
-        return 0
+        sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
     if (hook_op == "session-start" or (hook_op and "--offline" in os.environ.get("_MINDIE_UV_FLAGS", ""))) and not has_active_py:
         try:
             clean_h = str(known.host).strip().lower()
-            _atomic_json(
-                _seed_data_home() / "state" / clean_h / "pending-update-check.json",
-                {"schema": "mindie-pending-update/1", "host": clean_h, "reason": "session_start", "requested_at": time.time()},
-            )
-        except TimeoutError:
-            raise
-        except OSError:
-            pass
-        sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush()
-        return 0
+            _atomic_json(_seed_data_home() / "state" / clean_h / "pending-update-check.json", {"schema": "mindie-pending-update/1", "host": clean_h, "reason": "session_start", "requested_at": time.time()})
+        except TimeoutError: raise
+        except OSError: pass
+        sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
     if hook_op in {"stop", "session-end", "sessionend"}:
         roots = _seed_stop_roots(cfg_path)
         if not roots or not _seed_in_roots(stdin_buf := sys.stdin.buffer.read(1048577), roots):
-            sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush()
-            return 0
+            sys.stdout.buffer.write(b"{}\n"); sys.stdout.buffer.flush(); return 0
 
-    top_pkg = str(known.cli_module).split(".", 1)[0]
-    py = _provision_cold(known.host, Path(known.plugin_root).resolve(), cfg_path, smoke_module=top_pkg)
-    if not rest:
-        sys.stdout.write(json.dumps({"status": "provisioned", "python": str(py)}, sort_keys=True) + "\n")
-        return 0
+    py = _provision_cold(known.host, Path(known.plugin_root).resolve(), cfg_path, smoke_module=str(known.cli_module).split(".", 1)[0])
+    if not rest: sys.stdout.write(json.dumps({"status": "provisioned", "python": str(py)}, sort_keys=True) + "\n"); return 0
     stdio_kw: dict[str, object] = {"input": stdin_buf} if stdin_buf is not None else {}
     if stdin_buf is None:
-        try:
-            sys.stdin.fileno(); sys.stdout.fileno(); sys.stderr.fileno()
-            stdio_kw = {"stdin": sys.stdin, "stdout": sys.stdout, "stderr": sys.stderr}
-        except Exception:
-            pass
-    proc = subprocess.run(
-        [str(py), "-I", "-X", "utf8", "-m", known.cli_module, "--host", known.host, "--plugin-root", known.plugin_root, "--config", known.config, *rest],
-        **stdio_kw,
-        creationflags=_CREATE_NO_WINDOW,
-    )
-    return proc.returncode
+        try: sys.stdin.fileno(); sys.stdout.fileno(); sys.stderr.fileno(); stdio_kw = {"stdin": sys.stdin, "stdout": sys.stdout, "stderr": sys.stderr}
+        except Exception: pass
+    return subprocess.run([str(py), "-I", "-X", "utf8", "-m", known.cli_module, "--host", known.host, "--plugin-root", known.plugin_root, "--config", known.config, *rest], **stdio_kw, creationflags=_CREATE_NO_WINDOW).returncode
 
 
 if __name__ == "__main__":

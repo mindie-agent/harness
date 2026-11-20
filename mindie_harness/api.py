@@ -71,7 +71,7 @@ from .runtime.activation import (
 from .runtime.builder import PreparedGeneration, prepare_candidate_runtime
 from .runtime.registry import SHARED_COMPONENTS, RuntimeSelection
 
-__version__: Final[str] = "0.1.6"
+__version__: Final[str] = "0.1.7"
 API_VERSION: Final[int] = 1
 
 
