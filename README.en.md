@@ -1,12 +1,12 @@
 # MindIE Harness (`mindie-harness`)
 
 <p>
-  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.8-blue" alt="Release v0.1.8"></a>
+  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.9-blue" alt="Release v0.1.9"></a>
 </p>
 
 简体中文: [README.md](README.md) | English
 
-`mindie-harness` (repository `mindie-agent/harness`, import package `mindie_harness`, version `0.1.8`) is the **zero-heavy-dependency, pure-Python-stdlib shared plugin substrate** (`API_VERSION = 1`) powering all 7 MindIE Agent host plugins (`codex`, `cc`, `kimi`, `dsh`, `agy`, `wb`, `oc`).
+`mindie-harness` (repository `mindie-agent/harness`, import package `mindie_harness`, version `0.1.9`) is the **zero-heavy-dependency, pure-Python-stdlib shared plugin substrate** (`API_VERSION = 1`) powering the MindIE Agent host plugins `codex`, `cc`, `kimi`, `dsh`, `agy`, `wb`, `oc`, and `omp` (oh-my-pi).
 
 ## Core Responsibilities
 

@@ -2,7 +2,7 @@
 
 [English](CONTRIBUTING.en.md) | 简体中文
 
-感谢为 `mindie-harness` 贡献代码！本仓承载全部 7 个宿主插件共用的纯标准库底座，任何改动都会直接影响 macOS、Linux、Windows 11 与 WSL2 上的宿主启动、热更新与 MCP 并发可靠性。
+感谢为 `mindie-harness` 贡献代码！本仓承载 MindIE Agent 宿主插件共用的纯标准库底座，任何改动都会直接影响 macOS、Linux、Windows 11 与 WSL2 上的宿主启动、热更新与 MCP 并发可靠性。
 
 ## 1. 标准平铺目录与 Git Worktree 开发流
 

@@ -33,12 +33,12 @@ import pytest
 from mindie_harness.atomic import atomic_write_json
 from mindie_harness.bootstrap.seed_main import _seed_stop_roots, render_plugin_bootstrap_template
 from mindie_harness.component_commands import rebind_component_commands
-from mindie_harness.installer import _configured
+from mindie_harness.installer import _configured, detect_installed_hosts, run_install
 from mindie_harness.mcp.gateway import ManagedMCPAdapter, rebind_native_plugin_if_needed, resolve_remote_profile
 from mindie_harness.mcp import gateway_dispatch
 from mindie_harness.mcp.gateway_dispatch import COMPONENT_MODULES, dispatch_remote_tool, run_component_tool, run_diagnostics_tool
-from mindie_harness.mcp.router import RequestContext
-from mindie_harness.paths import HarnessError, ProfileRef, venv_python_path
+from mindie_harness.mcp.router import MCPRouter, RequestContext
+from mindie_harness.paths import HOSTS, HarnessError, ProfileRef, venv_python_path
 from mindie_harness.process.supervisor import Deadline, ProcessOutcome
 from mindie_harness.runtime import wheelhouse as wheelhouse_mod
 from mindie_harness.runtime import wheelhouse_assets
@@ -87,8 +87,47 @@ def test_local_only_seed_stop_gate_and_template_budget(tmp_path: Path) -> None:
     )
     atomic_write_json(cfg_dir / "codex.json", {"host": "codex"})
     assert _seed_stop_roots(cfg_dir / "codex.json") == [os.path.normcase(str(root.resolve()))]
-    for host in ("codex", "cc", "kimi", "dsh", "agy", "wb", "oc"):
+    for host in HOSTS:
         assert len(render_plugin_bootstrap_template(host).splitlines()) < 115
+
+
+@pytest.mark.parametrize("marker", ["binary", "host-config", "mindie-config", "session"])
+def test_omp_installer_detects_native_host(tmp_path: Path, marker: str) -> None:
+    env = {"HOME": str(tmp_path), "PATH": str(tmp_path), "MINDIE_CONFIG_HOME": str(tmp_path / "cfg")}
+    assert detect_installed_hosts(env) == []
+
+    if marker == "binary":
+        exe = tmp_path / ("omp.exe" if os.name == "nt" else "omp")
+        exe.touch()
+        exe.chmod(0o755)
+    elif marker == "host-config":
+        (tmp_path / ".omp").mkdir()
+    elif marker == "mindie-config":
+        (tmp_path / "cfg").mkdir()
+        (tmp_path / "cfg" / "omp.json").touch()
+    else:
+        env["PI_SESSION_ID"] = "omp-session"
+    assert detect_installed_hosts(env) == ["omp"]
+
+
+def test_omp_installer_alias_and_profile_isolation(tmp_path: Path) -> None:
+    cfg = tmp_path / "cfg"
+    data = tmp_path / "data"
+    env = {"HOME": str(tmp_path), "PATH": str(tmp_path), "MINDIE_CONFIG_HOME": str(cfg), "MINDIE_DATA_HOME": str(data)}
+    original = {"host": "codex", "admission_path": str(data / "legacy-admission.sqlite3")}
+    atomic_write_json(cfg / "codex.json", original)
+    profile = ProfileRef.resolve("omp", env=env)
+    assert profile.config_path == cfg / "omp.json"
+    assert profile.state_dir == data / "state" / "omp"
+    assert profile.generations_dir == data / "runtimes" / "omp"
+    assert profile.admission_db == profile.state_dir / "admission.sqlite3"
+
+    result = run_install(host="oh-my-pi", env=env, skip_runtime=True)
+    assert result["detected_hosts"] == ["codex"]
+    assert result["configured_hosts"] == ["omp"]
+    assert result["runtimes"] == {"omp": {"status": "skipped", "reportable": False}}
+    assert json.loads((cfg / "codex.json").read_text(encoding="utf-8")) == original
+    assert not profile.config_path.exists()
 
 
 def test_wheelhouse_checksum_cache_staging_and_backoff(tmp_path: Path) -> None:
@@ -178,6 +217,25 @@ def test_gateway_identity_surfaces_and_rebind(tmp_path: Path) -> None:
     assert updated["component_commands"]["profiler"] == [sys.executable, "-I", "-X", "utf8", "-m", "mindie_profiler"]
     assert updated["component_commands"]["custom"] == ["keep"]
     assert rebind_native_plugin_if_needed(profile) is None
+
+
+def test_omp_gateway_session_isolation_and_canonical_remote_profile(tmp_path: Path) -> None:
+    profile = _profile(tmp_path, "omp")
+    adapter = ManagedMCPAdapter("omp")
+    inherited = {"CODEX_THREAD_ID": "codex-thread", "CLAUDE_SESSION_ID": "claude-session"}
+    request = {"id": 1, "params": {"name": "mindie_status"}}
+    with_meta = {"id": 2, "params": {"name": "mindie_status", "_meta": {"sessionId": "omp-meta"}}}
+    assert resolve_remote_profile("omp", {}) == "canonical"
+    assert adapter.extract_session_identity(request, inherited) is None
+    assert adapter.extract_session_identity(request, {**inherited, "PI_SESSION_ID": " omp-session "}) == "omp-session"
+    assert adapter.extract_session_identity(with_meta, {"PI_SESSION_ID": "omp-session"}) == "omp-meta"
+
+    router = MCPRouter(profile, session_extractor=adapter.extract_session_identity, base_env=inherited)
+    result = router.call_tool(request)
+    assert result["isError"] is False
+    assert json.loads(result["content"][0]["text"])["session_id"] == f"omp-conn-{router.connection_id[:12]}"
+    assert not profile.binds_db.exists()
+    assert not profile.receipts_db.exists()
 
 
 def _context(tool_name: str = "remote_bash", *, env: dict[str, str] | None = None, session: str = "unit-session") -> RequestContext:

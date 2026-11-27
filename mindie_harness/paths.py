@@ -38,7 +38,7 @@ import sys
 import time
 from typing import Any, Mapping
 
-HOSTS: tuple[str, ...] = ("codex", "cc", "kimi", "dsh", "agy", "wb", "oc")
+HOSTS: tuple[str, ...] = ("codex", "cc", "kimi", "dsh", "agy", "wb", "oc", "omp")
 SQLITE_BUSY_TIMEOUT_MS = 5000
 SQLITE_MIN_BUDGET_SECONDS = 5.0
 _OCTAL_ESCAPE_RE = re.compile(r"\\([0-7]{3})")

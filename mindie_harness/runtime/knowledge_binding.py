@@ -61,6 +61,7 @@ HOST_TRANSCRIPT_CANDIDATES: dict[str, tuple[str, ...]] = {
     "agy": ("scripts/agy_transcript.py", "plugins/mindie-agent/scripts/agy_transcript.py"),
     "wb": ("scripts/wb_transcript.py", "plugins/mindie-agent/scripts/wb_transcript.py"),
     "oc": ("scripts/opencode_transcript.py", "plugins/mindie-agent/scripts/opencode_transcript.py"),
+    "omp": ("scripts/omp_transcript.py",),
 }
 
 

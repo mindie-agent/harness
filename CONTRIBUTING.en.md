@@ -2,7 +2,7 @@
 
 简体中文: [CONTRIBUTING.md](CONTRIBUTING.md) | English
 
-Thank you for contributing to `mindie-harness`! Because this repository provides the shared pure-stdlib substrate for all 7 MindIE Agent host plugins, changes here directly govern process safety, atomic auto-updates, and concurrent MCP reliability across macOS, Linux, Windows 11, and WSL2.
+Thank you for contributing to `mindie-harness`! Because this repository provides the shared pure-stdlib substrate for the MindIE Agent host plugins, changes here directly govern process safety, atomic auto-updates, and concurrent MCP reliability across macOS, Linux, Windows 11, and WSL2.
 
 ## 1. Flat Workspace & Linked Git Worktree Workflow
 

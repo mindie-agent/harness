@@ -3,7 +3,7 @@
 [Role]
 Provides `HOST_REMOTE_PROFILES`, `resolve_remote_profile`,
 `rebind_native_plugin_if_needed`, and `ManagedMCPAdapter(DefaultHostAdapter)` so any
-of the 7 thin host plugins can delete its bespoke `mcp_server.py` / `knowledge_cli.py`
+host plugin can delete its bespoke `mcp_server.py` / `knowledge_cli.py`
 / `diagnostic_support.py` while keeping `remote`, `tools`, `components`, `knowledge`,
 and `all` surfaces identical.
 
@@ -54,7 +54,7 @@ from .gateway_dispatch import (
     run_diagnostics_tool,
 )
 from .knowledge_rpc import KNOWLEDGE_NAMES, KNOWLEDGE_TOOL_SCHEMAS, invoke_knowledge_tool
-from .router import RequestContext
+from .router import RequestContext, _extract_meta_session
 
 _SESSION_ENV_KEYS: tuple[str, ...] = (
     "CODEX_THREAD_ID",
@@ -285,20 +285,9 @@ class ManagedMCPAdapter(DefaultHostAdapter):
 
     def extract_session_identity(self, request: Mapping[str, Any], env: Mapping[str, str]) -> str | None:
         try:
-            params = request.get("params")
-            meta = params.get("_meta") if isinstance(params, Mapping) else None
-            if isinstance(meta, Mapping):
-                for key in ("session_id", "sessionId", "threadId", "conversationId", "claudecode/sessionId"):
-                    value = meta.get(key)
-                    if isinstance(value, str) and value.strip():
-                        return value.strip()
-            for key in _SESSION_ENV_KEYS:
-                value = env.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
+            return _extract_meta_session(request, env, host=self.host, env_keys=_SESSION_ENV_KEYS)
         except Exception:
             return None
-        return None
 
     def mcp_tools(self, surface: str, profile: ProfileRef) -> list[dict[str, Any]]:
         clean = str(surface or "all").strip().lower()

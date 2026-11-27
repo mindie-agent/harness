@@ -3,7 +3,7 @@
 [Role]
 Forwards console-script and `-m mindie_harness.cli` invocations directly to
 `mindie_harness.api.run_host` so `mindie-bench` `upgrade_acceptance.py` and all
-7 thin host plugin launchers share one canonical entrypoint.
+thin host plugin launchers share one canonical entrypoint.
 
 [Invariants]
 - Zero heavy imports; `< 15ms` cold execution for `--version` and `inspect`.

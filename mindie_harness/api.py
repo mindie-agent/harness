@@ -1,8 +1,8 @@
-"""Stable `API_VERSION = 1` public facade and `mindie-harness` CLI for all 7 host plugins.
+"""Stable `API_VERSION = 1` public facade and `mindie-harness` CLI for MindIE Agent host plugins.
 
 [Role]
 Exposes the single authoritative public contract (`API_VERSION = 1`) consumed by
-`mindie-agent-{codex,cc,kimi,dsh,agy,wb,oc}`: `HostAdapter`, `DefaultHostAdapter`,
+`mindie-agent-{codex,cc,kimi,dsh,agy,wb,oc,omp}`: `HostAdapter`, `DefaultHostAdapter`,
 `ProfileRef`, `Deadline`, `ProcessSpec`, `ProcessOutcome`, `RuntimeSelection`,
 `PreparedGeneration`, `ActivationResult`, `run_owned`, `prepare_runtime`,
 `activate_runtime`, `maintain_runtime`, `serve_mcp`, `ensure_knowledge_binding`,
@@ -39,7 +39,7 @@ from typing import Any, BinaryIO, Final, Protocol, runtime_checkable
 from .atomic import read_json_safe
 from .locks import LockTimeoutError
 from .mcp.doctor import DOCTOR_TOOL_NAME, doctor_tool_definition, run_doctor_tool
-from .mcp.router import MCPRouter, RequestContext
+from .mcp.router import MCPRouter, RequestContext, _extract_meta_session
 from .mcp.server import MCPStdioServer
 from .paths import (
     HOSTS,
@@ -71,13 +71,13 @@ from .runtime.activation import (
 from .runtime.builder import PreparedGeneration, prepare_candidate_runtime
 from .runtime.registry import SHARED_COMPONENTS, RuntimeSelection
 
-__version__: Final[str] = "0.1.8"
+__version__: Final[str] = "0.1.9"
 API_VERSION: Final[int] = 1
 
 
 @runtime_checkable
 class HostAdapter(Protocol):
-    """Protocol implemented by each of the 7 thin host plugins (`codex..oc`)."""
+    """Protocol implemented by each thin MindIE Agent host plugin."""
 
     host: str
 
@@ -136,6 +136,8 @@ class DefaultHostAdapter:
         request: Mapping[str, Any],
         env: Mapping[str, str],
     ) -> str | None:
+        if self.host.strip().lower() == "omp":
+            return _extract_meta_session(request, env, host=self.host)
         params = request.get("params")
         meta = params.get("_meta") if isinstance(params, Mapping) else None
         if isinstance(meta, Mapping):

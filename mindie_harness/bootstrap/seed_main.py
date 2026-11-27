@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 SEED_LOCK_SCHEMA = "mindie-harness-seed/1"
-SEED_VERSION = "0.1.8"
+SEED_VERSION = "0.1.9"
 MIN_FREE_BYTES = int(2.5 * (1024 ** 3))
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _WIN_EXTS = (".exe", ".cmd", ".bat", ".com", ".ps1")
@@ -84,7 +84,7 @@ def verify_seed_lock(pyz_path: str | Path, lock_path: str | Path) -> dict[str, A
 def render_plugin_bootstrap_template(host: str, *, cli_module: str = "mindie_harness.cli") -> str:
     """Emit the `< 115`-line pure-stdlib host plugin cold-start forwarding script."""
     clean_host = str(host).strip().lower()
-    if clean_host not in {"codex", "cc", "kimi", "dsh", "agy", "wb", "oc"}:
+    if clean_host not in {"codex", "cc", "kimi", "dsh", "agy", "wb", "oc", "omp"}:
         raise ValueError(f"Unsupported host: {host!r}")
     raw_template = r'''#!/usr/bin/env python3
 """Deterministic stdlib cold-start launcher for MindIE (__HOST_LABEL__)."""

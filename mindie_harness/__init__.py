@@ -1,7 +1,7 @@
-"""MindIE Harness (`mindie_harness`): pure-stdlib shared substrate for all 7 host plugins.
+"""MindIE Harness (`mindie_harness`): pure-stdlib shared substrate for MindIE Agent host plugins.
 
 [Role]
-Root package exporting `API_VERSION = 1`, `__version__ = "0.1.8"`, and the stable
+Root package exporting `API_VERSION = 1`, `__version__ = "0.1.9"`, and the stable
 public facade from `mindie_harness.api`. Placed at repository root (`harness/mindie_harness/`)
 so `mindie_diagnostics/triage_card.py` (`layout == "package"`) resolves GitHub
 source permalinks cleanly.
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Final
 
-__version__: Final[str] = "0.1.8"
+__version__: Final[str] = "0.1.9"
 API_VERSION: Final[int] = 1
 
 from .api import (
