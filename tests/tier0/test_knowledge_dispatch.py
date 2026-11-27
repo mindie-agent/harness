@@ -160,3 +160,21 @@ def test_rpc_preserves_deadline_cleanup_grace(loop_api):
     deadline = Deadline.from_timeout(20, cleanup_grace=5)
     assert call(loop_api, "query", {"query": "x"}, deadline=deadline)["isError"] is False
     assert 10 < loop_api.rpc.call_args.kwargs["timeout"] <= 15
+
+
+@pytest.mark.parametrize("method,selector", [
+    ("query", {"query": "MiniMax-H3 distributed-layerwise-offload", "domain": "mindie-sd"}),
+    ("explain", {"ref": "mindie://mindie-sd/units/unit-minimax-h3@1"}),
+])
+def test_consult_reference_intent_is_advertised_and_forwarded(loop_api, method, selector):
+    from mindie_harness.mcp.knowledge_schemas import KNOWLEDGE_TOOL_SCHEMAS
+
+    schema = next(tool["inputSchema"] for tool in KNOWLEDGE_TOOL_SCHEMAS
+                  if tool["name"] == f"knowledge_{method}")
+    assert "reference" in schema["properties"]["intent"]["enum"]
+    args = {**selector, "intent": "reference", "conditions": {"framework": "vllm-omni"}}
+    assert call(loop_api, method, args)["isError"] is False
+    payload = loop_api.rpc.call_args.args[2]
+    assert payload["intent"] == "reference"
+    assert payload["conditions"] == {"framework": "vllm-omni"}
+    assert loop_api.select.call_args.kwargs.get("domain") == selector.get("domain")

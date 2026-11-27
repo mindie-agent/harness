@@ -54,7 +54,11 @@ GUIDE = {
     "consult": (
         "When an information gap remains, call "
         "knowledge_query(query=<bottleneck>, mode=<mode>) and read the cards you will "
-        "rely on with knowledge_explain. In explore mode pass native_subcontext=True, "
+        "rely on with knowledge_explain. For cross-framework background, use "
+        "intent=reference in both tools, select the source domain in the query, and read "
+        "exact refs from reference_cards. Keep "
+        "the observed conditions. Use an ordinary explain with those conditions before "
+        "recording a reference as directly applicable. In explore mode pass native_subcontext=True, "
         "ledger_entries and bottleneck_summary, and seed a fresh subagent only with "
         "exploration_context.subagent_fact_pack.prompt_brief. Complete with "
         '{"mode": <mode>, "unit_refs": [{"unit_id", "revision"}]}, or with '

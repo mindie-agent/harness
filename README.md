@@ -10,6 +10,8 @@
 
 ## 核心职责边界
 
+在 RSI Consult 中，若其他框架的规程可能提供排障线索，`knowledge_query` 和 `knowledge_explain` 支持 `intent="reference"`。保留实际环境条件，从 `reference_cards` 选取版本绑定的引用查阅原文。采用规程前使用默认精读并检查 `ready_to_apply`。
+
 1. **跨平台受管进程与 Windows 11 零弹窗内核监管 (`mindie_harness.process`)**
    - Windows 统一采用 `CreateProcessW(CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP)`，严禁 `CREATE_NEW_CONSOLE` / `DETACHED_PROCESS`；在 `ResumeThread` 前挂载嵌套非继承 Job Object（`KILL_ON_JOB_CLOSE` + 控制面 `512 MiB` 内存硬限 + 显式守护进程 `JOB_OBJECT_LIMIT_BREAKAWAY_OK` + 后台维护 `BELOW_NORMAL_PRIORITY_CLASS` + `CpuRateControl`）。
    - 系统计划任务 / GUI Worker 强制双层校验 `.venv\Scripts\pythonw.exe` 与 `pyvenv.cfg` 基底 `pythonw.exe` 的 PE 头 `OptionalHeader.Subsystem == 2`（`IMAGE_SUBSYSTEM_WINDOWS_GUI`），并自动使用基底 CPython `venvwlauncher.exe` 修复 `uv <= 0.12.3` 生成的控制台子系统启动器。
