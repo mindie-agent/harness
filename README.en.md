@@ -10,6 +10,8 @@
 
 ## Core Responsibilities
 
+In RSI Consult, set `intent="reference"` on `knowledge_query` and `knowledge_explain` to consult relevant guidance from another framework. Keep the observed conditions and select an exact reference from `reference_cards`. Use the default explain and check `ready_to_apply` before applying the guidance.
+
 1. **Cross-Platform Process Supervision & Windows 11 Zero-Popup Kernel Safety (`mindie_harness.process`)**
    - Spawns Windows children via `CreateProcessW(CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP)` (forbidding `CREATE_NEW_CONSOLE` and `DETACHED_PROCESS`) and attaches a non-inheritable nested Job Object (`KILL_ON_JOB_CLOSE`, `512 MiB` control-plane memory limit, optional `JOB_OBJECT_LIMIT_BREAKAWAY_OK` for explicit daemons, `BELOW_NORMAL_PRIORITY_CLASS`, and `CpuRateControl`) **before** `ResumeThread`.
    - Verifies PE `OptionalHeader.Subsystem == 2` (`IMAGE_SUBSYSTEM_WINDOWS_GUI`) on both `.venv\Scripts\pythonw.exe` and base `pyvenv.cfg` `pythonw.exe` interpreters, automatically repairing `uv <= 0.12.3` console-subsystem (`Subsystem == 3`) venv `pythonw.exe` shims from CPython `venvwlauncher.exe`.
