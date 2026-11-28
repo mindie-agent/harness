@@ -136,16 +136,7 @@ class DefaultHostAdapter:
         request: Mapping[str, Any],
         env: Mapping[str, str],
     ) -> str | None:
-        if self.host.strip().lower() == "omp":
-            return _extract_meta_session(request, env, host=self.host)
-        params = request.get("params")
-        meta = params.get("_meta") if isinstance(params, Mapping) else None
-        if isinstance(meta, Mapping):
-            for key in ("session_id", "sessionId", "threadId", "conversationId", "claudecode/sessionId"):
-                val = meta.get(key)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-        return env.get("MINDIE_SESSION_ID") or env.get("REMOTE_DEV_SESSION_ID")
+        return _extract_meta_session(request, env, host=self.host)
 
     def mcp_tools(self, surface: str, profile: ProfileRef) -> list[dict[str, Any]]:
         if self._tools:

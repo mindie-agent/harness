@@ -42,6 +42,9 @@ HOST_ALIASES: dict[str, str] = {
     "agy": "agy", "antigravity": "agy", "wb": "wb", "workbuddy": "wb", "oc": "oc", "opencode": "oc",
     "omp": "omp", "oh-my-pi": "omp",
 }
+_HOST_SESSION_MARKERS: dict[str, tuple[str, ...]] = {
+    "omp": ("PI_SESSION_ID",),
+}
 _ONBOARDING_QUESTIONS = ["workspace_roots", "privacy_tier", "optional_ssh_npu_host"]
 _GH_STATE_PREFIX = "mindie-gh-state-"
 
@@ -88,7 +91,7 @@ def detect_installed_hosts(env: Mapping[str, str] | None = None) -> list[str]:
         if _which(binary, environ):
             found.add(host)
             continue
-        if host == "omp" and environ.get("PI_SESSION_ID", "").strip():
+        if any(environ.get(marker, "").strip() for marker in _HOST_SESSION_MARKERS.get(host, ())):
             found.add(host)
             continue
         if host == "agy" and _which("agy", environ):

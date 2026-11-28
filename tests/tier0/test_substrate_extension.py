@@ -35,6 +35,7 @@ from mindie_harness.bootstrap.seed_main import _seed_stop_roots, render_plugin_b
 from mindie_harness.component_commands import rebind_component_commands
 from mindie_harness.installer import _configured, detect_installed_hosts, run_install
 from mindie_harness.mcp.gateway import ManagedMCPAdapter, rebind_native_plugin_if_needed, resolve_remote_profile
+from mindie_harness.api import DefaultHostAdapter
 from mindie_harness.mcp import gateway_dispatch
 from mindie_harness.mcp.gateway_dispatch import COMPONENT_MODULES, dispatch_remote_tool, run_component_tool, run_diagnostics_tool
 from mindie_harness.mcp.router import MCPRouter, RequestContext
@@ -226,6 +227,8 @@ def test_omp_gateway_session_isolation_and_canonical_remote_profile(tmp_path: Pa
     request = {"id": 1, "params": {"name": "mindie_status"}}
     with_meta = {"id": 2, "params": {"name": "mindie_status", "_meta": {"sessionId": "omp-meta"}}}
     assert resolve_remote_profile("omp", {}) == "canonical"
+    assert DefaultHostAdapter("omp").extract_session_identity(request, inherited) is None
+    assert DefaultHostAdapter("omp").extract_session_identity(request, {**inherited, "PI_SESSION_ID": " omp-session "}) == "omp-session"
     assert adapter.extract_session_identity(request, inherited) is None
     assert adapter.extract_session_identity(request, {**inherited, "PI_SESSION_ID": " omp-session "}) == "omp-session"
     assert adapter.extract_session_identity(with_meta, {"PI_SESSION_ID": "omp-session"}) == "omp-meta"
