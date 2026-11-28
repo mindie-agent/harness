@@ -194,7 +194,7 @@ def run_component_tool(
         extra = ["--json", "servers"]
     mod_name = COMPONENT_MODULES.get(name)
     if (
-        name in {"rsi_loop", "experiment_ledger"}
+        name in {"rsi_loop", "experiment_ledger", "rsi_plan", "rsi_autotune"}
         and mod_name is not None
         and len(base) >= 3
         and base[-2:] == ["-m", mod_name]
@@ -268,7 +268,7 @@ def run_component_tool(
         "elapsed_ms": outcome.elapsed_ms,
     }
     receipt_warning: str | None = None
-    if name in {"rsi_loop", "experiment_ledger"} and (outcome.stdout or "").strip():
+    if name in {"rsi_loop", "experiment_ledger", "rsi_plan", "rsi_autotune"} and (outcome.stdout or "").strip():
         try:
             parsed_rsi = json.loads((outcome.stdout or "").strip())
             if isinstance(parsed_rsi, Mapping):

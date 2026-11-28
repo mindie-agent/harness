@@ -411,6 +411,8 @@ def _run_candidate_in_process(require_fullstack: bool, deadline: Deadline) -> li
                     cli_matrix = [
                         ("rsi_loop", "mindie_harness", ["--help"]),
                         ("experiment_ledger", "mindie_harness", ["--help"]),
+                        ("rsi_plan", "mindie_harness", ["--help"]),
+                        ("rsi_autotune", "mindie_harness", ["--help"]),
                         ("sim", "mindie_sim", ["extensions", "list"]),
                         ("profiler", "mindie_profiler", ["--version"]),
                         ("debugger", "mindie_debugger", ["decode-code", "507015"]),
@@ -526,7 +528,7 @@ def _run_full_in_process(deadline: Deadline) -> list[dict[str, Any]]:
                 mcp_t1.request("ping", {}, framing="jsonl")
                 tlist = mcp_t1.request("tools/list", {}, framing="content-length")["tools"]
                 names = {t["name"] for t in tlist}
-                for req_tool in ("mindie_status", "mindie_doctor", "knowledge_query", "knowledge_explain", "knowledge_sync", "sim", "profiler", "debugger", "coordinator", "npu_top", "rsi_loop", "experiment_ledger", "remote_auth", "remote_write_stdin"):
+                for req_tool in ("mindie_status", "mindie_doctor", "knowledge_query", "knowledge_explain", "knowledge_sync", "sim", "profiler", "debugger", "coordinator", "npu_top", "rsi_loop", "experiment_ledger", "rsi_plan", "rsi_autotune", "remote_auth", "remote_write_stdin"):
                     assert req_tool in names, f"Missing tool {req_tool}"
                 st = mcp_t1.call_tool("mindie_status", {}, framing="jsonl")
                 assert st["isError"] is False and str(st["structuredContent"]["session_id"]).startswith("codex-conn-")

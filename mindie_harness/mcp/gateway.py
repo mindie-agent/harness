@@ -233,6 +233,8 @@ def _component_tools() -> list[dict[str, Any]]:
         _tool("debugger", "Run the bound MindIE debugger CLI.", debugger_props),
         _tool("rsi_loop", "Run the bound RSI experiment loop CLI.", rsi_props),
         _tool("experiment_ledger", "Run the bound RSI experiment ledger CLI.", rsi_props),
+        _tool("rsi_plan", "Validate or render a natural-language RSI plan.", rsi_props),
+        _tool("rsi_autotune", "Run the bounded natural-language RSI candidate loop.", rsi_props),
         {
             **_tool("diagnostics_status", "Read local diagnostics status.", diag_status_props),
             "annotations": {"readOnlyHint": True},

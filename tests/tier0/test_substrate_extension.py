@@ -195,10 +195,13 @@ def test_gateway_identity_surfaces_and_rebind(tmp_path: Path) -> None:
     tools = adapter.mcp_tools("tools", profile)
     names = [tool["name"] for tool in tools]
     assert names[:2] == ["mindie_status", "mindie_doctor"]
-    assert "knowledge_query" in names and len(tools) == 16
+    assert "knowledge_query" in names and len(tools) == 18
     assert "rsi_loop" in names and "experiment_ledger" in names
+    assert "rsi_plan" in names and "rsi_autotune" in names
     assert COMPONENT_MODULES["rsi_loop"] == "mindie_harness.rsi.rsi_loop"
     assert COMPONENT_MODULES["experiment_ledger"] == "mindie_harness.rsi.experiment_ledger"
+    assert COMPONENT_MODULES["rsi_plan"] == "mindie_harness.rsi.natural_language.rsi_plan"
+    assert COMPONENT_MODULES["rsi_autotune"] == "mindie_harness.rsi.natural_language.rsi_autotune"
     assert [tool["name"] for tool in adapter.mcp_tools("components", profile)][-1] == "diagnostics_bundle"
     assert adapter.extract_session_identity({"params": {"_meta": {"threadId": "t-1"}}}, {}) == "t-1"
     assert adapter.extract_session_identity({}, {"KIMI_SESSION_ID": "k-1"}) == "k-1"
