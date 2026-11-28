@@ -38,6 +38,8 @@ STANDARD_COMPONENT_COMMANDS: dict[str, tuple[str, str]] = {
     "debugger": ("mindie-debugger", "mindie_debugger.cli"),
     "rsi_loop": ("mindie-harness", "mindie_harness.rsi.rsi_loop"),
     "experiment_ledger": ("mindie-harness", "mindie_harness.rsi.experiment_ledger"),
+    "rsi_plan": ("mindie-harness", "mindie_harness.rsi.natural_language.rsi_plan"),
+    "rsi_autotune": ("mindie-harness", "mindie_harness.rsi.natural_language.rsi_autotune"),
 }
 COMPONENT_MODULES: dict[str, str] = {
     key: module for key, (_package, module) in STANDARD_COMPONENT_COMMANDS.items()
