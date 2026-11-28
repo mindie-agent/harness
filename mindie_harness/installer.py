@@ -8,8 +8,8 @@ a prebuilt channel wheelhouse (or a local plugin `pyproject.toml` / `wheelhouse`
 and return deterministic onboarding JSON.
 
 [Invariants]
-- `detect_installed_hosts` is strictly read-only and probes only `$PATH` and standard
-  per-host config directories; it never writes, deletes, or repairs host state.
+- `detect_installed_hosts` is strictly read-only and probes `$PATH`, standard
+  per-host config paths, and the OMP session marker.
 - `probe_gh_recommendation` is bounded (`2.5s` default), windowless through
   `run_owned`, sets `GH_PROMPT_DISABLED=1`, and uses a disposable `XDG_STATE_HOME`
   so an unauthenticated install creates zero real user state.
@@ -40,6 +40,10 @@ from .process.supervisor import Deadline, ProcessSpec, run_owned
 HOST_ALIASES: dict[str, str] = {
     "codex": "codex", "cc": "cc", "claude": "cc", "kimi": "kimi", "dsh": "dsh",
     "agy": "agy", "antigravity": "agy", "wb": "wb", "workbuddy": "wb", "oc": "oc", "opencode": "oc",
+    "omp": "omp", "oh-my-pi": "omp",
+}
+_HOST_SESSION_MARKERS: dict[str, tuple[str, ...]] = {
+    "omp": ("PI_SESSION_ID",),
 }
 _ONBOARDING_QUESTIONS = ["workspace_roots", "privacy_tier", "optional_ssh_npu_host"]
 _GH_STATE_PREFIX = "mindie-gh-state-"
@@ -81,9 +85,13 @@ def detect_installed_hosts(env: Mapping[str, str] | None = None) -> list[str]:
         "agy": ("antigravity", (home / ".gemini" / "antigravity", cfg_root / "agy.json")),
         "wb": ("workbuddy", (home / ".workbuddy", cfg_root / "wb.json")),
         "oc": ("opencode", (home / ".config" / "opencode", home / ".opencode", cfg_root / "oc.json")),
+        "omp": ("omp", (home / ".omp", cfg_root / "omp.json")),
     }
     for host, (binary, directories) in probes.items():
         if _which(binary, environ):
+            found.add(host)
+            continue
+        if any(environ.get(marker, "").strip() for marker in _HOST_SESSION_MARKERS.get(host, ())):
             found.add(host)
             continue
         if host == "agy" and _which("agy", environ):

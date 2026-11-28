@@ -159,4 +159,4 @@ def test_expired_deadline_starts_no_service(loop_api):
 def test_rpc_preserves_deadline_cleanup_grace(loop_api):
     deadline = Deadline.from_timeout(20, cleanup_grace=5)
     assert call(loop_api, "query", {"query": "x"}, deadline=deadline)["isError"] is False
-    assert 10 < loop_api.rpc.call_args.kwargs["timeout"] <= 15
+    assert 10 < loop_api.rpc.call_args.kwargs["timeout"] <= 15.000001

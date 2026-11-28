@@ -52,6 +52,7 @@ def _isolated_mindie_host_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         "KIMI_SESSION_ID",
         "OPENCODE_SESSION_ID",
         "CLAUDE_SESSION_ID",
+        "PI_SESSION_ID",
     ):
         monkeypatch.delenv(clear_key, raising=False)
     return sandbox

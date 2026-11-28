@@ -1,6 +1,6 @@
 # MindIE Harness (`mindie-agent/harness`) — Agent Operating Rules
 
-This repository owns the shared pure-stdlib plugin substrate (`mindie_harness`, `API_VERSION = 1`) consumed by all 7 MindIE Agent host plugins (`codex`, `cc`, `kimi`, `dsh`, `agy`, `wb`, `oc`).
+This repository owns the shared pure-stdlib plugin substrate (`mindie_harness`, `API_VERSION = 1`) consumed by the MindIE Agent host plugins (`codex`, `cc`, `kimi`, `dsh`, `agy`, `wb`, `oc`, `omp`).
 
 ## 1. Non-Negotiable Architectural Invariants
 

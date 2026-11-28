@@ -53,6 +53,7 @@ HOST_REMOTE_PROFILES: dict[str, str] = {
     "wb": "wb",
     "agy": "agy",
     "oc": "oc",
+    "omp": "canonical",
 }
 COMPONENT_OUTPUT_SPOOL_BYTES = 16 * 1024 * 1024
 MAX_STDIN_PAYLOAD_BYTES = 1 * 1024 * 1024

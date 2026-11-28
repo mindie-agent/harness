@@ -1,12 +1,12 @@
 # MindIE Harness (`mindie-harness`)
 
 <p>
-  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.8-blue" alt="Release v0.1.8"></a>
+  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.9-blue" alt="Release v0.1.9"></a>
 </p>
 
 [English](README.en.md) | 简体中文
 
-`mindie-harness`（仓库 `mindie-agent/harness`，导入包 `mindie_harness`，当前版本 `0.1.8`）是 MindIE Agent 7 个原生宿主插件（`codex`、`cc`、`kimi`、`dsh`、`agy`、`wb`、`oc`）共用的**零重依赖纯 Python 标准库底座**（`API_VERSION = 1`）。
+`mindie-harness`（仓库 `mindie-agent/harness`，导入包 `mindie_harness`，当前版本 `0.1.9`）是 MindIE Agent 原生宿主插件（`codex`、`cc`、`kimi`、`dsh`、`agy`、`wb`、`oc`、`omp`〔oh-my-pi〕）共用的**零重依赖纯 Python 标准库底座**（`API_VERSION = 1`）。
 
 ## 核心职责边界
 
@@ -25,7 +25,7 @@
 4. **纯标准库 RSI 实验账本与循环状态机 (`mindie_harness.rsi`)**
    - 统一承载兼容 linked Git worktree `.git` 文件的 `experiment_ledger`、`rsi_loop`（`mindie-rsi-loop/2`）、`rsi_crossover` 与 `rsi_explore`。
 5. **`< 60 KB` 确定性冷启动 Seed 与 Gate Layer 1 全栈自检 (`mindie_harness.bootstrap` / `mindie_harness.selftest`)**
-   - 确定性构建 `dist/mindie-harness-seed.pyz` 与 `dist/seed-lock.json`（`mindie-harness-seed/1`），向 7 个薄宿主插件输出 `< 115` 行纯标准库冷启动转发入口。
+   - 确定性构建 `dist/mindie-harness-seed.pyz` 与 `dist/seed-lock.json`（`mindie-harness-seed/1`），并为各薄宿主插件生成 `< 115` 行的纯标准库冷启动入口。
    - 内置 `mindie-harness selftest --mode candidate|full [--json]`（`mindie-selftest/1`），覆盖底座双帧协议、Topology 1（`.venv` 直连）与 Topology 2（纯标准库引导转发 `.venv` 子进程 IPC）及 9 包真实全栈闭环验证。
 
 ## 快速使用

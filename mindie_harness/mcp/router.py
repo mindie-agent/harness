@@ -314,7 +314,27 @@ def compute_tool_deadline(
     return Deadline.from_timeout(outer, cleanup_grace=grace)
 
 
-def _extract_meta_session(request: Mapping[str, Any], env: Mapping[str, str]) -> str | None:
+_DEFAULT_SESSION_ENV_KEYS = ("MINDIE_SESSION_ID", "REMOTE_DEV_SESSION_ID")
+_SESSION_ENV_KEYS = (
+    "MINDIE_SESSION_ID",
+    "REMOTE_DEV_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "KIMI_SESSION_ID",
+    "OPENCODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+)
+_HOST_SESSION_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    "omp": ("PI_SESSION_ID", "MINDIE_SESSION_ID", "REMOTE_DEV_SESSION_ID"),
+}
+
+
+def _extract_meta_session(
+    request: Mapping[str, Any],
+    env: Mapping[str, str],
+    *,
+    host: str,
+    env_keys: tuple[str, ...] = _DEFAULT_SESSION_ENV_KEYS,
+) -> str | None:
     params = request.get("params")
     meta = params.get("_meta") if isinstance(params, Mapping) else None
     if isinstance(meta, Mapping):
@@ -322,14 +342,8 @@ def _extract_meta_session(request: Mapping[str, Any], env: Mapping[str, str]) ->
             val = meta.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
-    for env_key in (
-        "MINDIE_SESSION_ID",
-        "REMOTE_DEV_SESSION_ID",
-        "CODEX_THREAD_ID",
-        "KIMI_SESSION_ID",
-        "OPENCODE_SESSION_ID",
-        "CLAUDE_SESSION_ID",
-    ):
+    session_env_keys = _HOST_SESSION_ENV_KEYS.get(host.strip().lower(), env_keys)
+    for env_key in session_env_keys:
         val = env.get(env_key)
         if isinstance(val, str) and val.strip():
             return val.strip()
@@ -612,7 +626,12 @@ class MCPRouter:
                 self._session_extractor(request, self._base_env)
                 if self._session_extractor is not None
                 else None
-            ) or _extract_meta_session(request, self._base_env)
+            ) or _extract_meta_session(
+                request,
+                self._base_env,
+                host=self.profile.host,
+                env_keys=_SESSION_ENV_KEYS,
+            )
             effective_bind_id = _extract_meta_bind_id(request)
 
             bound_cwd: Path | None = None
